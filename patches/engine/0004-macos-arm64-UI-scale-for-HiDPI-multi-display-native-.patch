@@ -1,0 +1,560 @@
+From 778f74b560ad541085d6cee48e29c4a45bad7956 Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Wed, 9 Sep 2026 18:12:42 -0400
+Subject: [PATCH 4/4] macos-arm64: UI scale for HiDPI, multi-display native
+ modes
+
+- vgui surface: vgui_scale (0 = auto: render pixels per window point);
+  applied to the 2D projection, screen size, cursor and mouse events, the
+  engine's UI-size root panels, and the client's mouse recentering.
+- display info reports real pixel sizes; native mode clamping uses the
+  largest display's pixel size; mode list is the union of all displays.
+---
+ appframework/glmrendererinfo_osx.mm       | 50 +++++++++++++++++++
+ appframework/sdlmgr.cpp                   | 42 ++++++++++++++--
+ engine/matsys_interface.cpp               | 41 ++++++++++++---
+ engine/sys_getmodes.cpp                   |  7 ++-
+ engine/sys_mainwind.cpp                   | 20 ++++----
+ engine/vgui_baseui_interface.cpp          |  7 ++-
+ game/client/in_mouse.cpp                  |  4 +-
+ public/VGuiMatSurface/IMatSystemSurface.h |  4 ++
+ vguimatsurface/Cursor.cpp                 | 23 ++++++++-
+ vguimatsurface/Input.cpp                  | 11 +++-
+ vguimatsurface/MatSystemSurface.cpp       | 61 ++++++++++++++++++++++-
+ vguimatsurface/MatSystemSurface.h         |  6 +++
+ 12 files changed, 244 insertions(+), 32 deletions(-)
+
+diff --git a/appframework/glmrendererinfo_osx.mm b/appframework/glmrendererinfo_osx.mm
+index c622240..2a3aa3d 100644
+--- a/appframework/glmrendererinfo_osx.mm
++++ b/appframework/glmrendererinfo_osx.mm
+@@ -522,6 +522,8 @@ extern "C" int DisplayInfoSortFunction( GLMDisplayInfo* const *A, GLMDisplayInfo
+ }
+ 
+ 
++extern "C" int DisplayModeSortFunction( GLMDisplayMode * const *A, GLMDisplayMode * const *B );
++
+ void	GLMRendererInfo::PopulateDisplays( void )
+ {
+ 	Assert( !m_displays );
+@@ -555,6 +557,38 @@ void	GLMRendererInfo::PopulateDisplays( void )
+ 	{
+ 		(*this->m_displays)[i]->PopulateModes();
+ 	}
++
++	// The engine only ever asks display 0 for its mode list, but the game can go
++	// fullscreen on any display (sdl_displayindex). Merge every display's modes
++	// into display 0 so e.g. the Retina panel's native size is offered while an
++	// external monitor is the main display.
++	if ( m_displays->Count() > 1 )
++	{
++		GLMDisplayInfo *pPrimary = (*m_displays)[0];
++		for ( int i = 1; i < m_displays->Count(); i++ )
++		{
++			GLMDisplayInfo *pOther = (*m_displays)[i];
++			FOR_EACH_VEC( (*pOther->m_modes), j )
++			{
++				GLMDisplayMode *pMode = (*pOther->m_modes)[j];
++				bool bDuplicate = false;
++				FOR_EACH_VEC( (*pPrimary->m_modes), k )
++				{
++					GLMDisplayMode *pHave = (*pPrimary->m_modes)[k];
++					if ( pHave->m_info.m_modePixelWidth == pMode->m_info.m_modePixelWidth && pHave->m_info.m_modePixelHeight == pMode->m_info.m_modePixelHeight )
++					{
++						bDuplicate = true;
++						break;
++					}
++				}
++				if ( !bDuplicate )
++				{
++					pPrimary->m_modes->AddToTail( new GLMDisplayMode( pMode->m_info.m_modePixelWidth, pMode->m_info.m_modePixelHeight, pMode->m_info.m_modeRefreshHz ) );
++				}
++			}
++		}
++		pPrimary->m_modes->Sort( DisplayModeSortFunction );
++	}
+ }
+ 
+ const char *CheesyRendererDecode( uint value )
+@@ -1443,8 +1477,24 @@ GLMDisplayInfo::GLMDisplayInfo( CGDirectDisplayID displayID, CGOpenGLDisplayMask
+ 	m_info.m_glDisplayMask			= displayMask;
+ 	
+ 	// extract info about this display such as pixel width and height
++	// CGDisplayPixelsWide/High return points on HiDPI displays; ask the current
++	// mode for the real pixel size so "display mode" / clamping code sees the
++	// native resolution (e.g. 3024x1964 rather than 1512x982).
+ 	m_info.m_displayPixelWidth		= (uint)CGDisplayPixelsWide( m_info.m_cgDisplayID );
+ 	m_info.m_displayPixelHeight		= (uint)CGDisplayPixelsHigh( m_info.m_cgDisplayID );
++	{
++		CGDisplayModeRef curMode = CGDisplayCopyDisplayMode( m_info.m_cgDisplayID );
++		if ( curMode )
++		{
++			size_t pxW = CGDisplayModeGetPixelWidth( curMode ), pxH = CGDisplayModeGetPixelHeight( curMode );
++			if ( pxW > m_info.m_displayPixelWidth && pxH > m_info.m_displayPixelHeight )
++			{
++				m_info.m_displayPixelWidth = (uint)pxW;
++				m_info.m_displayPixelHeight = (uint)pxH;
++			}
++			CGDisplayModeRelease( curMode );
++		}
++	}
+ 
+ 	m_modes = NULL;
+ }
+diff --git a/appframework/sdlmgr.cpp b/appframework/sdlmgr.cpp
+index 8b0b544..6471f78 100644
+--- a/appframework/sdlmgr.cpp
++++ b/appframework/sdlmgr.cpp
+@@ -7,6 +7,9 @@
+ #ifdef USE_SDL
+ #include "SDL.h"
+ #include "SDL_opengl.h"
++#ifdef OSX
++#include <CoreGraphics/CoreGraphics.h>
++#endif
+ #endif
+ 
+ #include "appframework/ilaunchermgr.h"
+@@ -291,7 +294,7 @@ public:
+ 	virtual void GetMouseDelta( int &x, int &y, bool bIgnoreNextMouseDelta = false );
+ 
+ 	virtual void GetNativeDisplayInfo( int nDisplay, uint &nWidth, uint &nHeight, uint &nRefreshHz );
+-	float GetDisplayScale(); // pixels per point of the display the window is on
++	float GetDisplayScale( int nDisplay ); // pixels per point of an SDL display (-1: the window's)
+ 	virtual void RenderedSize( uint &width, uint &height, bool set );	// either set or retrieve rendered size value (from dxabstract)
+ 	virtual void DisplayedSize( uint &width, uint &height );			// query backbuffer size (window size whether FS or windowed)
+ 
+@@ -2154,14 +2157,45 @@ void CSDLMgr::GetNativeDisplayInfo( int nDisplay, uint &nWidth, uint &nHeight, u
+ 
+ 	// SDL reports desktop modes in points; report the native size in pixels so
+ 	// the HiDPI resolution is offered and labelled "(native)".
+-	float flScale = GetDisplayScale();
++	float flScale = GetDisplayScale( nDisplay );
+ 	nWidth = (uint)( nWidth * flScale + 0.5f );
+ 	nHeight = (uint)( nHeight * flScale + 0.5f );
+ }
+ 
+-// Pixels per point of the display the window is on (2.0 on Retina displays, 1.0 otherwise).
+-float CSDLMgr::GetDisplayScale()
++// Pixels per point of an SDL display (2.0 on Retina displays, 1.0 otherwise).
++float CSDLMgr::GetDisplayScale( int nDisplay )
+ {
++#ifdef OSX
++	// Match the SDL display to a CoreGraphics display by its bounds (both in points),
++	// then compare the current mode's pixel and point widths.
++	SDL_Rect rect;
++	if ( nDisplay >= 0 && SDL_GetDisplayBounds( nDisplay, &rect ) == 0 )
++	{
++		CGDirectDisplayID displays[16];
++		uint32_t nDisplays = 0;
++		if ( CGGetActiveDisplayList( 16, displays, &nDisplays ) == kCGErrorSuccess )
++		{
++			for ( uint32_t i = 0; i < nDisplays; i++ )
++			{
++				CGRect bounds = CGDisplayBounds( displays[i] );
++				if ( (int)bounds.origin.x != rect.x || (int)bounds.origin.y != rect.y )
++					continue;
++				float flScale = 1.0f;
++				CGDisplayModeRef mode = CGDisplayCopyDisplayMode( displays[i] );
++				if ( mode )
++				{
++					size_t ptW = CGDisplayModeGetWidth( mode );
++					size_t pxW = CGDisplayModeGetPixelWidth( mode );
++					if ( ptW > 0 && pxW > ptW )
++						flScale = (float)pxW / (float)ptW;
++					CGDisplayModeRelease( mode );
++				}
++				return flScale;
++			}
++		}
++	}
++#endif
++	// fall back to the window's own backing scale
+ 	if ( !m_Window )
+ 		return 1.0f;
+ 	int ww = 0, wh = 0, dw = 0, dh = 0;
+diff --git a/engine/matsys_interface.cpp b/engine/matsys_interface.cpp
+index e97bb8b..cc5734e 100644
+--- a/engine/matsys_interface.cpp
++++ b/engine/matsys_interface.cpp
+@@ -45,6 +45,7 @@
+ 
+ #if defined( USE_SDL )
+ #include "SDL.h"
++#include "appframework/ilaunchermgr.h"
+ #endif
+ 
+ //X360TEMP
+@@ -429,14 +430,28 @@ static void ReadMaterialSystemConfigFromRegistry( MaterialSystem_Config_t &confi
+ 		conVar.SetValue( displayIndex );
+ 		displayIndex = conVar.GetInt();
+ 
+-		// Make sure the width / height isn't too large for this display.
+-		SDL_Rect rect;
+-		if ( !SDL_GetDisplayBounds( displayIndex, &rect ) )
++		// Make sure the width / height isn't too large for the displays.
++		// Native size in pixels (SDL display bounds are in points, which on a
++		// HiDPI display is half the resolution the game can actually render at),
++		// and the largest of all displays because the display index may not be
++		// settled yet this early in startup; the mode change path re-validates.
++		uint nDisplayWidth = 0, nDisplayHeight = 0;
++		for ( int i = 0; i < SDL_GetNumVideoDisplays(); i++ )
+ 		{
+-			if ( ( config.m_VideoMode.m_Width > rect.w ) || ( config.m_VideoMode.m_Height > rect.h ) )
++			uint w = 0, h = 0, hz = 0;
++			g_pLauncherMgr->GetNativeDisplayInfo( i, w, h, hz );
++			if ( w > nDisplayWidth || ( w == nDisplayWidth && h > nDisplayHeight ) )
+ 			{
+-				config.m_VideoMode.m_Width = rect.w;
+-				config.m_VideoMode.m_Height = rect.h;
++				nDisplayWidth = w;
++				nDisplayHeight = h;
++			}
++		}
++		if ( nDisplayWidth > 0 && nDisplayHeight > 0 )
++		{
++			if ( ( config.m_VideoMode.m_Width > (int)nDisplayWidth ) || ( config.m_VideoMode.m_Height > (int)nDisplayHeight ) )
++			{
++				config.m_VideoMode.m_Width = nDisplayWidth;
++				config.m_VideoMode.m_Height = nDisplayHeight;
+ 			}
+ 		}
+ 	}
+@@ -668,6 +683,20 @@ static void OverrideMaterialSystemConfigFromCommandLine( MaterialSystem_Config_t
+ 	// Clamp the requested dimensions to the display resolution
+ 	MaterialVideoMode_t videoMode;
+ 	materials->GetDisplayMode( videoMode );
++#if defined( USE_SDL ) && !defined( SWDS )
++	// The adapter's display is not necessarily the one we go fullscreen on; allow
++	// the largest native pixel size of any display (the mode change path re-validates).
++	for ( int i = 0; i < SDL_GetNumVideoDisplays(); i++ )
++	{
++		uint w = 0, h = 0, hz = 0;
++		g_pLauncherMgr->GetNativeDisplayInfo( i, w, h, hz );
++		if ( (int)w > videoMode.m_Width || ( (int)w == videoMode.m_Width && (int)h > videoMode.m_Height ) )
++		{
++			videoMode.m_Width = w;
++			videoMode.m_Height = h;
++		}
++	}
++#endif
+ 	config.m_VideoMode.m_Width = MIN( videoMode.m_Width, config.m_VideoMode.m_Width );
+ 	config.m_VideoMode.m_Height = MIN( videoMode.m_Height, config.m_VideoMode.m_Height );
+ 
+diff --git a/engine/sys_getmodes.cpp b/engine/sys_getmodes.cpp
+index 43dce4d..5f3dc41 100644
+--- a/engine/sys_getmodes.cpp
++++ b/engine/sys_getmodes.cpp
+@@ -43,6 +43,7 @@ typedef void *HDC;
+ #include "materialsystem/imaterialsystemhardwareconfig.h"
+ #include "jpeglib/jpeglib.h"
+ #include "vgui/ISurface.h"
++#include "VGuiMatSurface/IMatSystemSurface.h"
+ #include "vgui_controls/Controls.h"
+ #include "gl_shader.h"
+ #include "sys_dll.h"
+@@ -334,12 +335,14 @@ int CVideoMode_Common::GetModeStereoHeight( void ) const
+ 
+ int CVideoMode_Common::GetModeUIWidth( void ) const
+ {
+-	return m_nUIWidth;
++	float flUIScale = g_pMatSystemSurface ? g_pMatSystemSurface->GetUIScale() : 1.0f;
++	return (int)( m_nUIWidth / flUIScale + 0.5f );
+ }
+ 
+ int CVideoMode_Common::GetModeUIHeight( void ) const
+ {
+-    return m_nUIHeight;
++	float flUIScale = g_pMatSystemSurface ? g_pMatSystemSurface->GetUIScale() : 1.0f;
++    return (int)( m_nUIHeight / flUIScale + 0.5f );
+ }
+ 
+ 
+diff --git a/engine/sys_mainwind.cpp b/engine/sys_mainwind.cpp
+index 6807392..b4e4e84 100644
+--- a/engine/sys_mainwind.cpp
++++ b/engine/sys_mainwind.cpp
+@@ -1616,17 +1616,19 @@ void CGame::GetDesktopInfo( int &width, int &height, int &refreshrate )
+ 
+ #ifdef OSX
+ 	// SDL display bounds are in points; the game's video modes are in pixels
+-	// (HiDPI window), so scale to pixels or the native mode gets filtered out.
+-	if ( g_pLauncherMgr && g_pLauncherMgr->GetWindowRef() )
++	// (HiDPI window), so use the largest display's native pixel size instead,
++	// or the Retina native mode gets filtered out / clamped.
++	if ( g_pLauncherMgr )
+ 	{
+-		SDL_Window *pWindow = (SDL_Window *)g_pLauncherMgr->GetWindowRef();
+-		int ww = 0, wh = 0, dw = 0, dh = 0;
+-		SDL_GetWindowSize( pWindow, &ww, &wh );
+-		SDL_GL_GetDrawableSize( pWindow, &dw, &dh );
+-		if ( ww > 0 && dw > ww )
++		for( int i = 0; i < SDL_GetNumVideoDisplays(); i++ )
+ 		{
+-			width = (int)( (float)width * dw / ww + 0.5f );
+-			height = (int)( (float)height * dw / ww + 0.5f );
++			uint w = 0, h = 0, hz = 0;
++			g_pLauncherMgr->GetNativeDisplayInfo( i, w, h, hz );
++			if ( ( (int)w > width ) || ( ( (int)w == width ) && ( (int)h > height ) ) )
++			{
++				width = (int)w;
++				height = (int)h;
++			}
+ 		}
+ 	}
+ #endif
+diff --git a/engine/vgui_baseui_interface.cpp b/engine/vgui_baseui_interface.cpp
+index 9fa8c89..45dc5f8 100644
+--- a/engine/vgui_baseui_interface.cpp
++++ b/engine/vgui_baseui_interface.cpp
+@@ -1711,11 +1711,10 @@ void CEngineVGui::Paint( PaintMode_t mode )
+ 	// draw from the main panel down
+ 	vgui::Panel *panel = staticPanel;
+ 
+-	// Force engine's root panel (staticPanel) to be full screen size
++	// Force engine's root panel (staticPanel) to be full screen size (in UI space, see IMatSystemSurface::GetUIScale)
+ 	{
+-		int x, y, w, h;
+-		CMatRenderContextPtr pRenderContext( materials );
+-		pRenderContext->GetViewport( x, y, w, h );
++		int w, h;
++		vgui::surface()->GetScreenSize( w, h );
+ 		panel->SetBounds(0, 0, w, h); // ignore x and y here because the viewport takes care of that
+ 	}
+ 
+diff --git a/game/client/in_mouse.cpp b/game/client/in_mouse.cpp
+index bcf715a..d912159 100644
+--- a/game/client/in_mouse.cpp
++++ b/game/client/in_mouse.cpp
+@@ -311,7 +311,7 @@ void CInput::Init_Mouse (void)
+ void CInput::GetWindowCenter( int&x, int& y )
+ {
+ 	int w, h;
+-	engine->GetScreenSize( w, h );
++	vgui::surface()->GetScreenSize( w, h ); // UI space: SetMousePos/GetMousePos go through vgui
+ 
+ 	x = w >> 1;
+ 	y = h >> 1;
+@@ -577,7 +577,7 @@ void CInput::AccumulateMouse( void )
+ 	}
+ 
+ 	int w, h;
+-	engine->GetScreenSize( w, h );
++	vgui::surface()->GetScreenSize( w, h ); // UI space: GetMousePos/SetMousePos go through vgui
+ 
+ 	// x,y = screen center
+ 	int x = w >> 1;	x;
+diff --git a/public/VGuiMatSurface/IMatSystemSurface.h b/public/VGuiMatSurface/IMatSystemSurface.h
+index 8d76b80..a2921ee 100644
+--- a/public/VGuiMatSurface/IMatSystemSurface.h
++++ b/public/VGuiMatSurface/IMatSystemSurface.h
+@@ -115,6 +115,10 @@ public:
+ 	// begin and end skin composition painting
+ 	virtual void BeginSkinCompositionPainting() = 0;
+ 	virtual void EndSkinCompositionPainting() = 0;
++
++	// UI scale: vgui coordinates are multiplied by this when drawn (and mouse
++	// input divided by it), so the UI keeps a usable size at HiDPI resolutions.
++	virtual float GetUIScale() = 0;
+ };
+ 
+ 
+diff --git a/vguimatsurface/Cursor.cpp b/vguimatsurface/Cursor.cpp
+index 5451541..934cf26 100644
+--- a/vguimatsurface/Cursor.cpp
++++ b/vguimatsurface/Cursor.cpp
+@@ -478,10 +478,24 @@ bool IsCursorLocked()
+ //-----------------------------------------------------------------------------
+ void CursorSetPos( void *hwnd, int x, int y )
+ {
+-#if defined( USE_SDL )
++#if defined( USE_SDL ) && !defined( PLATFORM_WINDOWS )
+ 	if ( s_bCursorVisible )
+-#endif
++	{
++		// x/y are in UI space (render pixels / UI scale); the window wants points.
++		int windowWidth = 0, windowHeight = 0;
++		SDL_GetWindowSize( ( SDL_Window * )g_pLauncherMgr->GetWindowRef(), &windowWidth, &windowHeight );
++		int uiWidth, uiHeight;
++		g_MatSystemSurface.GetScreenSize( uiWidth, uiHeight );
++		if ( uiWidth > 0 && uiHeight > 0 && ( uiWidth != windowWidth || uiHeight != windowHeight ) )
++		{
++			x = x * windowWidth / uiWidth;
++			y = y * windowHeight / uiHeight;
++		}
+ 		g_pInputSystem->SetCursorPosition( x, y );
++	}
++#else
++	g_pInputSystem->SetCursorPosition( x, y );
++#endif
+ }
+ 
+ void CursorGetPos(void *hwnd, int &x, int &y)
+@@ -499,6 +513,11 @@ void CursorGetPos(void *hwnd, int &x, int &y)
+ 		CMatRenderContextPtr pRenderContext( g_pMaterialSystem );
+ 		int rx, ry, width, height;
+ 		pRenderContext->GetViewport( rx, ry, width, height );
++
++		// vgui works in UI space (render pixels / UI scale)
++		float flUIScale = g_MatSystemSurface.GetUIScale();
++		width = (int)( width / flUIScale + 0.5f );
++		height = (int)( height / flUIScale + 0.5f );
+ 	
+ 		if ( !s_bSoftwareCursorActive && (width != windowWidth || height != windowHeight )  )
+ 		{
+diff --git a/vguimatsurface/Input.cpp b/vguimatsurface/Input.cpp
+index 85836e0..529a9f4 100644
+--- a/vguimatsurface/Input.cpp
++++ b/vguimatsurface/Input.cpp
+@@ -476,7 +476,11 @@ bool InputHandleInputEvent( const InputEvent_t &event )
+ 			if ( event.m_nData == MOUSE_WHEEL )
+ 				return g_pIInput->InternalMouseWheeled( event.m_nData3 );
+ 			if ( event.m_nData == MOUSE_XY )
+-				return g_pIInput->InternalCursorMoved( event.m_nData2, event.m_nData3 );
++			{
++				// input system reports render pixels; vgui works in UI space
++				float flUIScale = g_MatSystemSurface.GetUIScale();
++				return g_pIInput->InternalCursorMoved( (int)( event.m_nData2 / flUIScale + 0.5f ), (int)( event.m_nData3 / flUIScale + 0.5f ) );
++			}
+ 		}
+ 		break;
+ 
+@@ -516,7 +520,10 @@ bool InputHandleInputEvent( const InputEvent_t &event )
+ 		return true;
+ 
+ 	case IE_LocateMouseClick:
+-		g_pIInput->InternalCursorMoved( event.m_nData, event.m_nData2 );
++		{
++			float flUIScale = g_MatSystemSurface.GetUIScale();
++			g_pIInput->InternalCursorMoved( (int)( event.m_nData / flUIScale + 0.5f ), (int)( event.m_nData2 / flUIScale + 0.5f ) );
++		}
+ 		return true;
+ 
+ 	case IE_InputLanguageChanged:
+diff --git a/vguimatsurface/MatSystemSurface.cpp b/vguimatsurface/MatSystemSurface.cpp
+index 02f1100..9b0b81a 100644
+--- a/vguimatsurface/MatSystemSurface.cpp
++++ b/vguimatsurface/MatSystemSurface.cpp
+@@ -14,6 +14,7 @@
+ 
+ #if defined( USE_SDL )
+ #include <appframework/ilaunchermgr.h>
++#include "SDL.h"
+ ILauncherMgr *g_pLauncherMgr = NULL;
+ #endif
+ 
+@@ -189,6 +190,7 @@ CMatSystemSurface::CMatSystemSurface() : m_pEmbeddedPanel(NULL), m_pWhite(NULL)
+ {
+ 	m_iBoundTexture = -1; 
+ 	m_HWnd = NULL; 
++	m_flUIScale = 0.0f;
+ 	m_bIn3DPaintMode = false;
+ 	m_b3DPaintRenderToTexture = false;
+ 	m_bDrawingIn3DWorld = false;
+@@ -700,6 +702,12 @@ void CMatSystemSurface::StartDrawing( void )
+ 	CMatRenderContextPtr pRenderContext( g_pMaterialSystem );
+ 	pRenderContext->GetViewport( x, y, width, height);
+ 
++	// Recompute the UI scale once per drawing session (window/backbuffer may have changed).
++	m_flUIScale = ComputeUIScale();
++	float flUIScale = m_flUIScale;
++	width = (int)( width / flUIScale + 0.5f );
++	height = (int)( height / flUIScale + 0.5f );
++
+ 	// we don't want to include x and y from the viewport here. DX will 
+ 	// automatically translate any drawing we do into that viewport.
+ 	m_pSurfaceExtents[0] = 0;
+@@ -713,6 +721,7 @@ void CMatSystemSurface::StartDrawing( void )
+ 	pRenderContext->Scale( 1, -1, 1 );
+ 	
+ 	//___stop___();
++	// Ortho over the UI-space size: vgui coordinates map onto the full viewport, scaled by the UI scale.
+ 	pRenderContext->Ortho( g_flPixelOffsetX, g_flPixelOffsetY, width + g_flPixelOffsetX, height + g_flPixelOffsetY, -1.0f, 1.0f ); 
+ 
+ 	// make sure there is no translation and rotation laying around
+@@ -2539,6 +2548,52 @@ void CMatSystemSurface::GetScreenSize(int &iWide, int &iTall)
+ 	//   CMatRenderContextPtr pRenderContext( g_pMaterialSystem );
+ 	IMatRenderContext *pRenderContext = g_pMaterialSystem->GetRenderContext();
+ 	pRenderContext->GetViewport( x, y, iWide, iTall );
++
++	float flScale = GetUIScale();
++	if ( flScale != 1.0f )
++	{
++		iWide = (int)( iWide / flScale + 0.5f );
++		iTall = (int)( iTall / flScale + 0.5f );
++	}
++}
++
++//-----------------------------------------------------------------------------
++// UI scale. vgui_scale 0 (default) = automatic: render pixels per window point,
++// so at a HiDPI native resolution (e.g. 3024x1964 on a 1512x982-point display)
++// the UI is laid out in points and drawn 2x, instead of being tiny.
++//-----------------------------------------------------------------------------
++static ConVar vgui_scale( "vgui_scale", "0", FCVAR_ARCHIVE, "UI scale factor. 0 = automatic (render pixels per window point), otherwise 1..4.", true, 0.0f, true, 4.0f );
++
++float CMatSystemSurface::ComputeUIScale()
++{
++	float flScale = vgui_scale.GetFloat();
++	if ( flScale <= 0.0f )
++	{
++		flScale = 1.0f;
++#if defined( USE_SDL )
++		int nBackBufferWidth = 0, nBackBufferHeight = 0;
++		g_pMaterialSystem->GetBackBufferDimensions( nBackBufferWidth, nBackBufferHeight );
++		int nWindowWidth = 0, nWindowHeight = 0;
++		if ( g_pLauncherMgr && g_pLauncherMgr->GetWindowRef() )
++		{
++			SDL_GetWindowSize( (SDL_Window *)g_pLauncherMgr->GetWindowRef(), &nWindowWidth, &nWindowHeight );
++		}
++		if ( nWindowWidth > 0 && nBackBufferWidth > nWindowWidth )
++		{
++			flScale = (float)nBackBufferWidth / (float)nWindowWidth;
++		}
++#endif
++	}
++	return clamp( flScale, 1.0f, 4.0f );
++}
++
++float CMatSystemSurface::GetUIScale()
++{
++	if ( m_flUIScale <= 0.0f )
++	{
++		m_flUIScale = ComputeUIScale();
++	}
++	return m_flUIScale;
+ }
+ 
+ bool CMatSystemSurface::ForceScreenSizeOverride( bool bState, int wide, int tall )
+@@ -4505,7 +4560,11 @@ void CMatSystemSurface::PushFullscreenViewport()
+ 	pRenderContext->Scale( 1, -1, 1 );
+ 	
+ 	//___stop___();
+-	pRenderContext->Ortho( g_flPixelOffsetX, g_flPixelOffsetY, vw + g_flPixelOffsetX, vh + g_flPixelOffsetY, -1.0f, 1.0f ); 
++	{
++		float flUIScale = GetUIScale();
++		int uw = (int)( vw / flUIScale + 0.5f ), uh = (int)( vh / flUIScale + 0.5f );
++		pRenderContext->Ortho( g_flPixelOffsetX, g_flPixelOffsetY, uw + g_flPixelOffsetX, uh + g_flPixelOffsetY, -1.0f, 1.0f ); 
++	}
+ 
+ 	DisableClipping( true );
+ }
+diff --git a/vguimatsurface/MatSystemSurface.h b/vguimatsurface/MatSystemSurface.h
+index bc46b1f..86aea32 100644
+--- a/vguimatsurface/MatSystemSurface.h
++++ b/vguimatsurface/MatSystemSurface.h
+@@ -548,6 +548,12 @@ private:
+ 	};
+ 
+ 	ScreenOverride_t m_ScreenSizeOverride;
++
++public:
++	virtual float GetUIScale() OVERRIDE;
++private:
++	float m_flUIScale;	// cached; 0 = not computed yet
++	float ComputeUIScale();
+ 	ScreenOverride_t m_ScreenPosOverride;
+ 
+ 	int m_nFullscreenViewportX;
+-- 
+2.55.0
+
