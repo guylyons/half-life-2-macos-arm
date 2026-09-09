@@ -29,7 +29,9 @@
 			game+game_write		|gameinfo_path|.
 			gamebin			"@APP_GAMEBIN@"
 
-			game			"@STEAM_HL2@/hl2"
+			// "mod" as well as "game": the New Game dialog only lists chapter
+			// files found on the MOD path (cfg/chapter*.cfg live in Steam's hl2/cfg).
+			game+mod		"@STEAM_HL2@/hl2"
 			platform		"@STEAM_HL2@/platform"
 		}
 	}
