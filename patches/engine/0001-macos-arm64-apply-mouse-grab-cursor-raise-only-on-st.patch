@@ -1,0 +1,80 @@
+From c47393923362826b9c78fe549901d358bfc91328 Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Wed, 9 Sep 2026 14:48:17 -0400
+Subject: [PATCH] macos-arm64: apply mouse grab/cursor/raise only on state
+ change
+
+The game requests the mouse state every frame; on macOS SDL_RaiseWindow
+and the grab/cursor calls each synchronously round-trip to the window
+server, stalling most of every frame (main thread spent 84% of its time
+waiting on a SkyLight transaction lock).
+---
+ appframework/sdlmgr.cpp | 37 +++++++++++++++++++++++++++++++------
+ 1 file changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/appframework/sdlmgr.cpp b/appframework/sdlmgr.cpp
+index 53ca92d..352402f 100644
+--- a/appframework/sdlmgr.cpp
++++ b/appframework/sdlmgr.cpp
+@@ -353,6 +353,12 @@ private:
+ 
+ 	bool m_bCursorVisible;
+ 	bool m_bSetMouseVisibleCalled;
++	// Last mouse state actually applied to SDL, so OnFrameRendered only touches
++	// the window system when something changed (each call is a synchronous
++	// window-server round trip on macOS, and the game sets the state every frame).
++	int m_nAppliedWindowGrab;
++	int m_nAppliedRelativeMouse;
++	int m_nAppliedCursorVisible;
+ 	SDL_Cursor *m_hCursor;
+ 	bool m_bSetMouseCursorCalled;
+ 
+@@ -546,6 +552,9 @@ InitReturnVal_t CSDLMgr::Init()
+ 
+ 	m_bCursorVisible = true;
+ 	m_bSetMouseVisibleCalled = false;
++	m_nAppliedWindowGrab = -1;
++	m_nAppliedRelativeMouse = -1;
++	m_nAppliedCursorVisible = -1;
+ 	m_hCursor = NULL;
+ 	m_bSetMouseCursorCalled = false;
+ 
+@@ -1167,13 +1176,29 @@ void CSDLMgr::OnFrameRendered()
+ 			bRelativeMouseMode = SDL_FALSE;
+ 		}
+ 
+-		SDL_SetWindowGrab( m_Window, bWindowGrab );
+-		SDL_SetRelativeMouseMode( bRelativeMouseMode );
+-
+-		SDL_ShowCursor( m_bCursorVisible ? 1 : 0 );
++		// Only touch SDL/the window system when the requested state differs from
++		// what was last applied. The game requests this state every frame, and on
++		// macOS SDL_RaiseWindow (app activation) and the grab/cursor calls each
++		// synchronously round-trip to the window server, which stalled every frame.
++		bool bGrabChanged = ( (int)bWindowGrab != m_nAppliedWindowGrab );
++		if ( bGrabChanged )
++		{
++			SDL_SetWindowGrab( m_Window, bWindowGrab );
++			m_nAppliedWindowGrab = bWindowGrab;
++		}
++		if ( (int)bRelativeMouseMode != m_nAppliedRelativeMouse )
++		{
++			SDL_SetRelativeMouseMode( bRelativeMouseMode );
++			m_nAppliedRelativeMouse = bRelativeMouseMode;
++		}
++		if ( (int)m_bCursorVisible != m_nAppliedCursorVisible )
++		{
++			SDL_ShowCursor( m_bCursorVisible ? 1 : 0 );
++			m_nAppliedCursorVisible = m_bCursorVisible;
++		}
+ 
+-		// force non-fullscreen windows to the foreground if grabbed, so you can't get your mouse locked to something in the background.
+-		if ( bWindowGrab && !m_bFullScreen )
++		// force non-fullscreen windows to the foreground when they become grabbed, so you can't get your mouse locked to something in the background.
++		if ( bGrabChanged && bWindowGrab && !m_bFullScreen )
+ 		{
+ 			SDL_RaiseWindow( m_Window );
+ 		}
+-- 
+2.55.0
+
