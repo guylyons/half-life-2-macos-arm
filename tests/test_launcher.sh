@@ -16,7 +16,7 @@ echo "$out" | grep -q -- "-game \"$TMP/base/hl2\"" || { echo "FAIL: exec line mi
 echo "$out" | grep -q -- "-windowed" || { echo "FAIL: user args not forwarded"; exit 1; }
 grep -q "\"$TMP/steam/hl2\"" "$TMP/base/hl2/gameinfo.txt" || { echo "FAIL: gameinfo not rendered"; exit 1; }
 grep -q "@STEAM_HL2@" "$TMP/base/hl2/gameinfo.txt" && { echo "FAIL: placeholder left in gameinfo"; exit 1; }
-[ -f "$TMP/base/hl2/bin/libclient.dylib" ] || { echo "FAIL: libclient.dylib not copied"; exit 1; }
+grep -q "gamebin.*\"$TMP/app/Contents/Resources/hl2/bin\"" "$TMP/base/hl2/gameinfo.txt" || { echo "FAIL: gamebin not pointed at app"; exit 1; }
 [ -z "$(find "$TMP/steam" -newer "$TMP/ref")" ] || { echo "FAIL: steam dir modified"; exit 1; }
 
 # anniversary layout must be rejected
