@@ -1,0 +1,1720 @@
+From 4262440b6ec87b1ebe9fe23737b567986b8b6d77 Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Wed, 9 Sep 2026 19:49:51 -0400
+Subject: [PATCH 5/5] macos-arm64: ray-traced lighting layer (Metal)
+
+- rtmetal: Metal ray tracing module (BVH of world geometry, AO and sun
+  shadow rays, temporal accumulation, depth-aware blur, composite kernel).
+- togl glmrt: depth resolve into an IOSurface-backed texture and a GLSL
+  multiply composite, exported to the tracer via dlsym.
+- stdshaders RayTraceComposite: shader whose draw pass runs the tracer on
+  the render thread; matrices/settings travel as material vars.
+- client rt_layer: BSP world geometry extraction (faces + displacements),
+  light_environment sun direction, rt_* convars, capture and composite draws.
+---
+ game/client/client_base.vpc                   |   2 +
+ game/client/rt_layer.cpp                      | 362 ++++++++++++
+ game/client/rt_layer.h                        |   8 +
+ game/client/viewrender.cpp                    |   7 +
+ .../stdshaders/raytracecomposite.cpp          | 139 +++++
+ materialsystem/stdshaders/wscript             |   1 +
+ public/rtmetal/iraytracer.h                   |  47 ++
+ public/togl/linuxwin/cglmfbo.h                |   1 +
+ public/togl/linuxwin/cglmtex.h                |   1 +
+ public/togl/linuxwin/glmgr.h                  |   1 +
+ rtmetal/rtmetal.mm                            | 538 ++++++++++++++++++
+ rtmetal/wscript                               |  36 ++
+ togl/linuxwin/dxabstract.cpp                  |   1 +
+ togl/linuxwin/glmgr.cpp                       |   3 +
+ togl/linuxwin/glmrt.cpp                       | 341 +++++++++++
+ togl/wscript                                  |   3 +-
+ wscript                                       |   4 +
+ 17 files changed, 1494 insertions(+), 1 deletion(-)
+ create mode 100644 game/client/rt_layer.cpp
+ create mode 100644 game/client/rt_layer.h
+ create mode 100644 materialsystem/stdshaders/raytracecomposite.cpp
+ create mode 100644 public/rtmetal/iraytracer.h
+ create mode 100644 rtmetal/rtmetal.mm
+ create mode 100644 rtmetal/wscript
+ create mode 100644 togl/linuxwin/glmrt.cpp
+
+diff --git a/game/client/client_base.vpc b/game/client/client_base.vpc
+index 90e16cb..a689e35 100644
+--- a/game/client/client_base.vpc
++++ b/game/client/client_base.vpc
+@@ -480,6 +480,8 @@ $Project
+ 		$File	"viewpostprocess.cpp"
+ 		$File	"viewpostprocess.h"
+ 		$File	"viewrender.cpp"
++		$File	"rt_layer.cpp"
++		$File	"rt_layer.h"
+ 		$File	"$SRCDIR\game\shared\voice_banmgr.cpp"
+ 		$File	"$SRCDIR\game\shared\voice_status.cpp"
+ 		$File	"warp_overlay.cpp"
+diff --git a/game/client/rt_layer.cpp b/game/client/rt_layer.cpp
+new file mode 100644
+index 0000000..bd8d3ec
+--- /dev/null
++++ b/game/client/rt_layer.cpp
+@@ -0,0 +1,362 @@
++//========= Ray tracing layer: client side (macOS arm64 port) ===================
++// - At map load, extracts the world geometry (brush faces and displacements of
++//   the world model) from the .bsp and hands it to the Metal ray tracer.
++// - Reads light_environment for the sun direction.
++// - After the 3D scene, draws a fullscreen quad with the "RayTraceComposite"
++//   shader, whose draw pass runs the tracer on the render thread. Camera
++//   matrices and settings travel as material vars.
++//=============================================================================
++#include "cbase.h"
++#include "rt_layer.h"
++#include "bspfile.h"
++#include "bspflags.h"
++#include "filesystem.h"
++#include "ivrenderview.h"
++#include "materialsystem/imaterialsystem.h"
++#include "materialsystem/imaterialvar.h"
++#include "materialsystem/imaterial.h"
++#include "tier1/KeyValues.h"
++#include "tier1/interface.h"
++#include "mathlib/vmatrix.h"
++#include "rtmetal/iraytracer.h"
++#include "view_shared.h"
++
++#include "tier0/memdbgon.h"
++
++#ifdef OSX
++
++static ConVar rt_enable( "rt_enable", "1", FCVAR_ARCHIVE, "Ray-traced lighting layer (ambient occlusion and sun shadows)." );
++static ConVar rt_ao( "rt_ao", "1", FCVAR_ARCHIVE, "Ray-traced ambient occlusion." );
++static ConVar rt_shadows( "rt_shadows", "0", FCVAR_ARCHIVE, "Ray-traced sun shadows (world only for now: mostly duplicates the lightmaps, so off by default)." );
++static ConVar rt_ao_radius( "rt_ao_radius", "96", FCVAR_ARCHIVE, "AO ray length in world units." );
++static ConVar rt_ao_strength( "rt_ao_strength", "0.8", FCVAR_ARCHIVE, "AO darkening, 0..1." );
++static ConVar rt_shadow_strength( "rt_shadow_strength", "0.6", FCVAR_ARCHIVE, "Sun shadow darkening, 0..1." );
++static ConVar rt_sun_angle( "rt_sun_angle", "1.0", FCVAR_ARCHIVE, "Sun angular radius in degrees (soft shadows)." );
++static ConVar rt_divisor( "rt_divisor", "2", FCVAR_ARCHIVE, "Trace resolution divisor (1 = full, 2 = half)." );
++static ConVar rt_ao_rays( "rt_ao_rays", "2", FCVAR_ARCHIVE, "AO rays per pixel per frame." );
++static ConVar rt_debug( "rt_debug", "0", 0, "0 off, 1 AO, 2 shadows, 3 normals, 4 depth." );
++static ConVar rt_stats( "rt_stats", "0", 0, "Print ray tracing timing to the console periodically." );
++
++static IRayTracer *s_pRayTracer = NULL;
++static bool s_bTriedLoad = false;
++static IMaterial *s_pCompositeMaterial = NULL;
++static IMaterial *s_pCaptureMaterial = NULL;
++static Vector s_vSunDir( 0, 0, 0 );
++static bool s_bWorldLoaded = false;
++static int s_nFrame = 0;
++
++static IRayTracer *GetRayTracer()
++{
++	if ( !s_bTriedLoad )
++	{
++		s_bTriedLoad = true;
++		CSysModule *pModule = Sys_LoadModule( "rtmetal" );
++		if ( pModule )
++		{
++			CreateInterfaceFn factory = Sys_GetFactory( pModule );
++			if ( factory )
++				s_pRayTracer = (IRayTracer *)factory( RAYTRACER_INTERFACE_VERSION, NULL );
++		}
++		if ( s_pRayTracer && !s_pRayTracer->Init() )
++			s_pRayTracer = NULL;
++	}
++	return s_pRayTracer;
++}
++
++//-----------------------------------------------------------------------------
++// BSP world geometry extraction
++//-----------------------------------------------------------------------------
++template <class T> static const T *Lump( const byte *pBase, const dheader_t *pHeader, int nLump, int *pCount )
++{
++	const lump_t &l = pHeader->lumps[nLump];
++	*pCount = l.filelen / (int)sizeof( T );
++	return (const T *)( pBase + l.fileofs );
++}
++
++static bool ExtractWorldGeometry( const char *pMapName, CUtlVector<float> &verts, CUtlVector<unsigned int> &indices )
++{
++	CUtlBuffer buf;
++	if ( !filesystem->ReadFile( pMapName, "GAME", buf ) )
++		return false;
++	const byte *pBase = (const byte *)buf.Base();
++	const dheader_t *pHeader = (const dheader_t *)pBase;
++	if ( pHeader->ident != IDBSPHEADER )
++		return false;
++
++	int nVerts, nEdges, nSurfEdges, nFaces, nTexInfo, nTexData, nModels, nDispInfo, nDispVerts;
++	const dvertex_t *pVerts = Lump<dvertex_t>( pBase, pHeader, LUMP_VERTEXES, &nVerts );
++	const dedge_t *pEdges = Lump<dedge_t>( pBase, pHeader, LUMP_EDGES, &nEdges );
++	const int *pSurfEdges = Lump<int>( pBase, pHeader, LUMP_SURFEDGES, &nSurfEdges );
++	const dface_t *pFaces = Lump<dface_t>( pBase, pHeader, LUMP_FACES, &nFaces );
++	const texinfo_t *pTexInfo = Lump<texinfo_t>( pBase, pHeader, LUMP_TEXINFO, &nTexInfo );
++	const dtexdata_t *pTexData = Lump<dtexdata_t>( pBase, pHeader, LUMP_TEXDATA, &nTexData );
++	const dmodel_t *pModels = Lump<dmodel_t>( pBase, pHeader, LUMP_MODELS, &nModels );
++	const ddispinfo_t *pDispInfo = Lump<ddispinfo_t>( pBase, pHeader, LUMP_DISPINFO, &nDispInfo );
++	const CDispVert *pDispVerts = Lump<CDispVert>( pBase, pHeader, LUMP_DISP_VERTS, &nDispVerts );
++	int nStringTable, nStringData;
++	const int *pStringTable = Lump<int>( pBase, pHeader, LUMP_TEXDATA_STRING_TABLE, &nStringTable );
++	const char *pStringData = Lump<char>( pBase, pHeader, LUMP_TEXDATA_STRING_DATA, &nStringData );
++	if ( nModels < 1 || nFaces < 1 )
++		return false;
++
++	const int nSkipFlags = SURF_SKY | SURF_SKY2D | SURF_NODRAW | SURF_TRIGGER | SURF_HINT | SURF_SKIP | SURF_TRANS;
++	const dmodel_t &world = pModels[0];
++	CUtlVector<Vector> faceVerts;
++	int nSkippedTrans = 0;
++
++	for ( int f = world.firstface; f < world.firstface + world.numfaces && f < nFaces; f++ )
++	{
++		const dface_t &face = pFaces[f];
++		if ( face.texinfo < 0 || face.texinfo >= nTexInfo )
++			continue;
++		const texinfo_t &ti = pTexInfo[face.texinfo];
++		if ( ti.flags & nSkipFlags )
++		{
++			if ( ti.flags & SURF_TRANS ) nSkippedTrans++;
++			continue;
++		}
++		if ( ti.texdata >= 0 && ti.texdata < nTexData )
++		{
++			int nameIdx = pTexData[ti.texdata].nameStringTableID;
++			if ( nameIdx >= 0 && nameIdx < nStringTable )
++			{
++				const char *pName = pStringData + pStringTable[nameIdx];
++				if ( !V_strnicmp( pName, "tools/", 6 ) )
++					continue;
++			}
++		}
++
++		// gather the face polygon
++		faceVerts.RemoveAll();
++		for ( int e = 0; e < face.numedges; e++ )
++		{
++			int se = pSurfEdges[face.firstedge + e];
++			int v = ( se >= 0 ) ? pEdges[se].v[0] : pEdges[-se].v[1];
++			if ( v >= 0 && v < nVerts )
++				faceVerts.AddToTail( pVerts[v].point );
++		}
++		if ( faceVerts.Count() < 3 )
++			continue;
++
++		if ( face.dispinfo >= 0 && face.dispinfo < nDispInfo && faceVerts.Count() == 4 )
++		{
++			// displacement: rotate the quad so the corner nearest startPosition is first, then tessellate
++			const ddispinfo_t &disp = pDispInfo[face.dispinfo];
++			int start = 0; float bestDist = 1e30f;
++			for ( int i = 0; i < 4; i++ )
++			{
++				float d = ( faceVerts[i] - disp.startPosition ).LengthSqr();
++				if ( d < bestDist ) { bestDist = d; start = i; }
++			}
++			Vector c[4];
++			for ( int i = 0; i < 4; i++ ) c[i] = faceVerts[( start + i ) % 4];
++			int side = ( 1 << disp.power ) + 1;
++			if ( disp.m_iDispVertStart < 0 || disp.m_iDispVertStart + side * side > nDispVerts )
++				continue;
++			unsigned int base = verts.Count() / 3;
++			for ( int row = 0; row < side; row++ )
++			{
++				float t = (float)row / (float)( side - 1 );
++				Vector left = c[0] + ( c[1] - c[0] ) * t;
++				Vector right = c[3] + ( c[2] - c[3] ) * t;
++				for ( int col = 0; col < side; col++ )
++				{
++					float s = (float)col / (float)( side - 1 );
++					Vector p = left + ( right - left ) * s;
++					const CDispVert &dv = pDispVerts[disp.m_iDispVertStart + row * side + col];
++					p += dv.m_vVector * dv.m_flDist;
++					verts.AddToTail( p.x ); verts.AddToTail( p.y ); verts.AddToTail( p.z );
++				}
++			}
++			for ( int row = 0; row < side - 1; row++ )
++			{
++				for ( int col = 0; col < side - 1; col++ )
++				{
++					unsigned int a = base + row * side + col, b = a + 1, cc = a + side, d = cc + 1;
++					indices.AddToTail( a ); indices.AddToTail( b ); indices.AddToTail( cc );
++					indices.AddToTail( b ); indices.AddToTail( d ); indices.AddToTail( cc );
++				}
++			}
++			continue;
++		}
++
++		// plain polygon: fan
++		unsigned int base = verts.Count() / 3;
++		for ( int i = 0; i < faceVerts.Count(); i++ )
++		{
++			verts.AddToTail( faceVerts[i].x ); verts.AddToTail( faceVerts[i].y ); verts.AddToTail( faceVerts[i].z );
++		}
++		for ( int i = 1; i + 1 < faceVerts.Count(); i++ )
++		{
++			indices.AddToTail( base ); indices.AddToTail( base + i ); indices.AddToTail( base + i + 1 );
++		}
++	}
++	return indices.Count() >= 3;
++}
++
++//-----------------------------------------------------------------------------
++// Sun direction from light_environment
++//-----------------------------------------------------------------------------
++static Vector FindSunDirection()
++{
++	const char *pEnts = engine->GetMapEntitiesString();
++	if ( !pEnts )
++		return Vector( 0, 0, 0 );
++	const char *pFound = V_stristr( pEnts, "\"light_environment\"" );
++	if ( !pFound )
++		return Vector( 0, 0, 0 );
++	// back up to the opening brace of this entity, then parse its keys
++	const char *pStart = pFound;
++	while ( pStart > pEnts && *pStart != '{' ) pStart--;
++	const char *pEnd = strchr( pFound, '}' );
++	if ( !pEnd )
++		return Vector( 0, 0, 0 );
++	CUtlString block( pStart, pEnd - pStart );
++	KeyValues *pKV = new KeyValues( "ent" );
++	pKV->LoadFromBuffer( "ents", CUtlString( "\"ent\"\n" ) + block + "\n}\n" );
++	QAngle angles( 0, 0, 0 );
++	const char *pAngles = pKV->GetString( "angles", "0 0 0" );
++	sscanf( pAngles, "%f %f %f", &angles.x, &angles.y, &angles.z );
++	float pitch = angles.x;
++	if ( pKV->FindKey( "pitch" ) )
++		pitch = pKV->GetFloat( "pitch" );
++	else
++		pitch = -pitch;
++	pKV->deleteThis();
++	// light_environment's pitch is inverted relative to QAngle: negative = light shines downward,
++	// so AngleVectors with the raw pitch yields the direction toward the sun.
++	Vector fwd;
++	AngleVectors( QAngle( pitch, angles.y, 0 ), &fwd );
++	return fwd.Normalized();
++}
++
++//-----------------------------------------------------------------------------
++// Game system: map load / unload
++//-----------------------------------------------------------------------------
++class CRTLayerSystem : public CAutoGameSystem
++{
++public:
++	CRTLayerSystem() : CAutoGameSystem( "RTLayer" ) {}
++
++	virtual void LevelInitPostEntity() OVERRIDE
++	{
++		s_bWorldLoaded = false;
++		s_vSunDir.Init();
++		IRayTracer *pRT = GetRayTracer();
++		if ( !pRT )
++			return;
++		double t0 = Plat_FloatTime();
++		CUtlVector<float> verts; CUtlVector<unsigned int> indices;
++		if ( !ExtractWorldGeometry( engine->GetLevelName(), verts, indices ) )
++		{
++			Warning( "[rt] could not extract world geometry from %s\n", engine->GetLevelName() );
++			return;
++		}
++		pRT->SetWorldGeometry( verts.Base(), verts.Count() / 3, indices.Base(), indices.Count() / 3 );
++		s_vSunDir = FindSunDirection();
++		s_bWorldLoaded = true;
++		s_nFrame = 0;
++		Msg( "[rt] %s: %d triangles (%.0f ms), sun dir %.2f %.2f %.2f\n", engine->GetLevelName(), indices.Count() / 3, ( Plat_FloatTime() - t0 ) * 1000.0, s_vSunDir.x, s_vSunDir.y, s_vSunDir.z );
++	}
++
++	virtual void LevelShutdownPreEntity() OVERRIDE
++	{
++		s_bWorldLoaded = false;
++		if ( s_pRayTracer )
++			s_pRayTracer->ClearWorld();
++	}
++};
++static CRTLayerSystem s_RTLayerSystem;
++
++//-----------------------------------------------------------------------------
++// Per-frame composite
++//-----------------------------------------------------------------------------
++static IMaterial *GetCompositeMaterial()
++{
++	if ( !s_pCompositeMaterial )
++	{
++		KeyValues *pKV = new KeyValues( "RayTraceComposite" );
++		pKV->SetInt( "$rt_mode", 1 );
++		s_pCompositeMaterial = materials->CreateMaterial( "__rt_composite", pKV );
++		if ( s_pCompositeMaterial )
++			s_pCompositeMaterial->IncrementReferenceCount();
++	}
++	return s_pCompositeMaterial;
++}
++
++static IMaterial *GetCaptureMaterial()
++{
++	if ( !s_pCaptureMaterial )
++	{
++		KeyValues *pKV = new KeyValues( "RayTraceComposite" );
++		pKV->SetInt( "$rt_mode", 0 );
++		s_pCaptureMaterial = materials->CreateMaterial( "__rt_capture", pKV );
++		if ( s_pCaptureMaterial )
++			s_pCaptureMaterial->IncrementReferenceCount();
++	}
++	return s_pCaptureMaterial;
++}
++
++void RT_CaptureDepth()
++{
++	if ( !rt_enable.GetBool() || !s_bWorldLoaded )
++		return;
++	if ( !GetRayTracer() )
++		return;
++	IMaterial *pMat = GetCaptureMaterial();
++	if ( !pMat )
++		return;
++	bool bFound;
++	IMaterialVar *pVar = pMat->FindVar( "$rt_divisor", &bFound ); if ( bFound ) pVar->SetIntValue( clamp( rt_divisor.GetInt(), 1, 4 ) );
++	CMatRenderContextPtr pRenderContext( materials );
++	pRenderContext->DrawScreenSpaceQuad( pMat );
++}
++
++void RT_DrawComposite( const CViewSetup &view )
++{
++	if ( !rt_enable.GetBool() || !s_bWorldLoaded )
++		return;
++	IRayTracer *pRT = GetRayTracer();
++	if ( !pRT )
++		return;
++	IMaterial *pMat = GetCompositeMaterial();
++	if ( !pMat )
++		return;
++
++	VMatrix worldToView, viewToProj, worldToProj, worldToPixels;
++	render->GetMatricesForView( view, &worldToView, &viewToProj, &worldToProj, &worldToPixels );
++	VMatrix projToWorld;
++	MatrixInverseGeneral( worldToProj, projToWorld );
++	bool bFound;
++	IMaterialVar *pVar;
++	pVar = pMat->FindVar( "$rt_worldtoproj", &bFound ); if ( bFound ) pVar->SetMatrixValue( worldToProj );
++	pVar = pMat->FindVar( "$rt_projtoworld", &bFound ); if ( bFound ) pVar->SetMatrixValue( projToWorld );
++	pVar = pMat->FindVar( "$rt_camerapos", &bFound ); if ( bFound ) pVar->SetVecValue( view.origin.Base(), 3 );
++	pVar = pMat->FindVar( "$rt_sundir", &bFound ); if ( bFound ) pVar->SetVecValue( s_vSunDir.Base(), 3 );
++	pVar = pMat->FindVar( "$rt_aoradius", &bFound ); if ( bFound ) pVar->SetFloatValue( rt_ao_radius.GetFloat() );
++	pVar = pMat->FindVar( "$rt_aostrength", &bFound ); if ( bFound ) pVar->SetFloatValue( rt_ao_strength.GetFloat() );
++	pVar = pMat->FindVar( "$rt_shadowstrength", &bFound ); if ( bFound ) pVar->SetFloatValue( rt_shadow_strength.GetFloat() );
++	pVar = pMat->FindVar( "$rt_sunangle", &bFound ); if ( bFound ) pVar->SetFloatValue( rt_sun_angle.GetFloat() );
++	pVar = pMat->FindVar( "$rt_frame", &bFound ); if ( bFound ) pVar->SetIntValue( s_nFrame++ );
++	pVar = pMat->FindVar( "$rt_debug", &bFound ); if ( bFound ) pVar->SetIntValue( rt_debug.GetInt() );
++	pVar = pMat->FindVar( "$rt_ao", &bFound ); if ( bFound ) pVar->SetIntValue( rt_ao.GetInt() );
++	pVar = pMat->FindVar( "$rt_shadows", &bFound ); if ( bFound ) pVar->SetIntValue( rt_shadows.GetInt() );
++	pVar = pMat->FindVar( "$rt_divisor", &bFound ); if ( bFound ) pVar->SetIntValue( clamp( rt_divisor.GetInt(), 1, 4 ) );
++	pVar = pMat->FindVar( "$rt_aorays", &bFound ); if ( bFound ) pVar->SetIntValue( clamp( rt_ao_rays.GetInt(), 1, 8 ) );
++	CMatRenderContextPtr pRenderContext( materials );
++	pRenderContext->DrawScreenSpaceQuad( pMat );
++
++	if ( rt_stats.GetBool() && ( s_nFrame % 300 ) == 0 )
++		Msg( "[rt] %s\n", pRT->GetStatus() );
++}
++
++CON_COMMAND( rt_status, "Ray tracing layer status" )
++{
++	IRayTracer *pRT = GetRayTracer();
++	Msg( "[rt] %s; world %s\n", pRT ? pRT->GetStatus() : "module unavailable", s_bWorldLoaded ? "loaded" : "not loaded" );
++}
++
++#else
++void RT_CaptureDepth() {}
++void RT_DrawComposite( const CViewSetup &view ) {}
++#endif
+diff --git a/game/client/rt_layer.h b/game/client/rt_layer.h
+new file mode 100644
+index 0000000..391bab7
+--- /dev/null
++++ b/game/client/rt_layer.h
+@@ -0,0 +1,8 @@
++#ifndef RT_LAYER_H
++#define RT_LAYER_H
++#pragma once
++class CViewSetup;
++// Draws the ray-traced lighting composite over the current 3D scene (no-op when disabled/unavailable).
++void RT_CaptureDepth();
++void RT_DrawComposite( const CViewSetup &view );
++#endif
+diff --git a/game/client/viewrender.cpp b/game/client/viewrender.cpp
+index 704f071..8daa351 100644
+--- a/game/client/viewrender.cpp
++++ b/game/client/viewrender.cpp
+@@ -64,6 +64,7 @@
+ #endif
+ #include "rendertexture.h"
+ #include "viewpostprocess.h"
++#include "rt_layer.h"
+ #include "viewdebug.h"
+ 
+ #if defined USES_ECON_ITEMS
+@@ -2016,6 +2017,9 @@ void CViewRender::RenderView( const CViewSetup &view, int nClearFlags, int whatT
+ 		// Finish scene
+ 		render->SceneEnd();
+ 
++		// ray-traced lighting layer: grab the scene depth before post-processing reuses the depth buffer (macOS arm64 port)
++		RT_CaptureDepth();
++
+ 		// Draw lightsources if enabled
+ 		render->DrawLights();
+ 
+@@ -2089,6 +2093,9 @@ void CViewRender::RenderView( const CViewSetup &view, int nClearFlags, int whatT
+ 
+ 		PerformScreenSpaceEffects( 0, 0, view.width, view.height );
+ 
++		// ray-traced lighting layer (macOS arm64 port)
++		RT_DrawComposite( view );
++
+ 		if ( g_pMaterialSystemHardwareConfig->GetHDRType() == HDR_TYPE_INTEGER )
+ 		{
+ 			pRenderContext.GetFrom( materials );
+diff --git a/materialsystem/stdshaders/raytracecomposite.cpp b/materialsystem/stdshaders/raytracecomposite.cpp
+new file mode 100644
+index 0000000..08e7af7
+--- /dev/null
++++ b/materialsystem/stdshaders/raytracecomposite.cpp
+@@ -0,0 +1,139 @@
++//========= Ray tracing layer: composite shader (macOS arm64 port) ==============
++// The client draws a fullscreen quad with material "rt/composite" after the
++// 3D scene. This shader draws nothing itself; its dynamic pass runs on the
++// render thread with the GL context current and hands the frame to the Metal
++// ray tracer, which resolves depth, traces, and multiplies its result onto
++// the framebuffer through togl. Matrix/sun parameters travel as material vars
++// so they are in sync with the queued render thread.
++//=============================================================================
++#include "BaseVSShader.h"
++#include "screenspaceeffect_vs20.inc"
++#include "Bloom_ps20.inc"
++#include "Bloom_ps20b.inc"
++#include "rtmetal/iraytracer.h"
++#include "tier1/interface.h"
++#include "mathlib/vmatrix.h"
++
++static IRayTracer *s_pRayTracer = NULL;
++static bool s_bTriedLoad = false;
++
++static IRayTracer *GetRayTracer()
++{
++	if ( !s_bTriedLoad )
++	{
++		s_bTriedLoad = true;
++		CSysModule *pModule = Sys_LoadModule( "rtmetal" );
++		if ( pModule )
++		{
++			CreateInterfaceFn factory = Sys_GetFactory( pModule );
++			if ( factory )
++				s_pRayTracer = (IRayTracer *)factory( RAYTRACER_INTERFACE_VERSION, NULL );
++		}
++		if ( s_pRayTracer && !s_pRayTracer->Init() )
++			s_pRayTracer = NULL;
++		if ( !s_pRayTracer )
++			Warning( "[rt] rtmetal module unavailable; ray tracing disabled\n" );
++	}
++	return s_pRayTracer;
++}
++
++BEGIN_VS_SHADER_FLAGS( RayTraceComposite, "Ray tracing layer composite", SHADER_NOT_EDITABLE )
++	BEGIN_SHADER_PARAMS
++		SHADER_PARAM( RT_WORLDTOPROJ, SHADER_PARAM_TYPE_MATRIX, "", "world to projection matrix" )
++		SHADER_PARAM( RT_PROJTOWORLD, SHADER_PARAM_TYPE_MATRIX, "", "projection to world matrix" )
++		SHADER_PARAM( RT_CAMERAPOS, SHADER_PARAM_TYPE_VEC3, "[0 0 0]", "camera position" )
++		SHADER_PARAM( RT_SUNDIR, SHADER_PARAM_TYPE_VEC3, "[0 0 0]", "direction toward the sun" )
++		SHADER_PARAM( RT_AORADIUS, SHADER_PARAM_TYPE_FLOAT, "96", "" )
++		SHADER_PARAM( RT_AOSTRENGTH, SHADER_PARAM_TYPE_FLOAT, "0.8", "" )
++		SHADER_PARAM( RT_SHADOWSTRENGTH, SHADER_PARAM_TYPE_FLOAT, "0.6", "" )
++		SHADER_PARAM( RT_SUNANGLE, SHADER_PARAM_TYPE_FLOAT, "1.0", "" )
++		SHADER_PARAM( RT_FRAME, SHADER_PARAM_TYPE_INTEGER, "0", "" )
++		SHADER_PARAM( RT_DEBUG, SHADER_PARAM_TYPE_INTEGER, "0", "" )
++		SHADER_PARAM( RT_AO, SHADER_PARAM_TYPE_INTEGER, "1", "" )
++		SHADER_PARAM( RT_SHADOWS, SHADER_PARAM_TYPE_INTEGER, "1", "" )
++		SHADER_PARAM( RT_DIVISOR, SHADER_PARAM_TYPE_INTEGER, "2", "trace resolution divisor" )
++		SHADER_PARAM( RT_MODE, SHADER_PARAM_TYPE_INTEGER, "1", "0 = capture depth, 1 = trace and composite" )
++		SHADER_PARAM( RT_AORAYS, SHADER_PARAM_TYPE_INTEGER, "2", "AO rays per pixel per frame" )
++	END_SHADER_PARAMS
++
++	SHADER_INIT_PARAMS()
++	{
++	}
++
++	SHADER_INIT
++	{
++	}
++
++	SHADER_FALLBACK
++	{
++		return 0;
++	}
++
++	SHADER_DRAW
++	{
++		SHADOW_STATE
++		{
++			// A real shader pair must be bound or the (unimplemented) fixed-function
++			// transform path is used; colour writes are off so the quad itself draws nothing.
++			pShaderShadow->EnableDepthWrites( false );
++			pShaderShadow->EnableColorWrites( false );
++			pShaderShadow->EnableAlphaWrites( false );
++			pShaderShadow->VertexShaderVertexFormat( VERTEX_POSITION, 1, 0, 0 );
++			DECLARE_STATIC_VERTEX_SHADER( screenspaceeffect_vs20 );
++			SET_STATIC_VERTEX_SHADER( screenspaceeffect_vs20 );
++			if ( g_pHardwareConfig->SupportsPixelShaders_2_b() )
++			{
++				DECLARE_STATIC_PIXEL_SHADER( bloom_ps20b );
++				SET_STATIC_PIXEL_SHADER( bloom_ps20b );
++			}
++			else
++			{
++				DECLARE_STATIC_PIXEL_SHADER( bloom_ps20 );
++				SET_STATIC_PIXEL_SHADER( bloom_ps20 );
++			}
++		}
++		DYNAMIC_STATE
++		{
++			DECLARE_DYNAMIC_VERTEX_SHADER( screenspaceeffect_vs20 );
++			SET_DYNAMIC_VERTEX_SHADER( screenspaceeffect_vs20 );
++			if ( g_pHardwareConfig->SupportsPixelShaders_2_b() )
++			{
++				DECLARE_DYNAMIC_PIXEL_SHADER( bloom_ps20b );
++				SET_DYNAMIC_PIXEL_SHADER( bloom_ps20b );
++			}
++			else
++			{
++				DECLARE_DYNAMIC_PIXEL_SHADER( bloom_ps20 );
++				SET_DYNAMIC_PIXEL_SHADER( bloom_ps20 );
++			}
++			IRayTracer *pRT = GetRayTracer();
++			if ( pRT && params[RT_MODE]->GetIntValue() == 0 )
++			{
++				pRT->CaptureDepth( params[RT_DIVISOR]->GetIntValue() );
++			}
++			else if ( pRT )
++			{
++				RTFrameParams fp;
++				memset( &fp, 0, sizeof( fp ) );
++				const VMatrix &w2p = params[RT_WORLDTOPROJ]->GetMatrixValue();
++				const VMatrix &p2w = params[RT_PROJTOWORLD]->GetMatrixValue();
++				memcpy( fp.m_worldToProjection, w2p.Base(), sizeof( fp.m_worldToProjection ) );
++				memcpy( fp.m_projectionToWorld, p2w.Base(), sizeof( fp.m_projectionToWorld ) );
++				params[RT_CAMERAPOS]->GetVecValue( fp.m_cameraPos, 3 );
++				params[RT_SUNDIR]->GetVecValue( fp.m_sunDir, 3 );
++				fp.m_flAORadius = params[RT_AORADIUS]->GetFloatValue();
++				fp.m_flAOStrength = params[RT_AOSTRENGTH]->GetFloatValue();
++				fp.m_flShadowStrength = params[RT_SHADOWSTRENGTH]->GetFloatValue();
++				fp.m_flSunAngleDeg = params[RT_SUNANGLE]->GetFloatValue();
++				fp.m_nFrame = params[RT_FRAME]->GetIntValue();
++				fp.m_nDebugMode = params[RT_DEBUG]->GetIntValue();
++				fp.m_bAO = params[RT_AO]->GetIntValue();
++				fp.m_bShadows = params[RT_SHADOWS]->GetIntValue();
++				fp.m_nResolutionDivisor = params[RT_DIVISOR]->GetIntValue();
++				fp.m_nAORays = params[RT_AORAYS]->GetIntValue();
++				pRT->ApplyAndComposite( fp );
++			}
++		}
++		Draw();
++	}
++END_SHADER
+diff --git a/materialsystem/stdshaders/wscript b/materialsystem/stdshaders/wscript
+index 4d82e51..737fd96 100644
+--- a/materialsystem/stdshaders/wscript
++++ b/materialsystem/stdshaders/wscript
+@@ -90,6 +90,7 @@ def build(bld):
+ 		'sample4x4.cpp',
+ 		'sample4x4_blend.cpp',
+ 		'screenspace_general.cpp',
++		'raytracecomposite.cpp',
+ 		'sfm_blurfilterx.cpp',
+ 		'sfm_blurfiltery.cpp',
+ 		'sfm_downsample.cpp',
+diff --git a/public/rtmetal/iraytracer.h b/public/rtmetal/iraytracer.h
+new file mode 100644
+index 0000000..e69bf49
+--- /dev/null
++++ b/public/rtmetal/iraytracer.h
+@@ -0,0 +1,47 @@
++//========= Ray tracing layer interface (macOS arm64 port) =====================
++// Implemented by librtmetal.dylib (Metal). Consumed by the RayTraceComposite
++// shader (render thread) and the client (geometry upload at map load).
++//=============================================================================
++#ifndef IRAYTRACER_H
++#define IRAYTRACER_H
++#pragma once
++
++#include "interface.h"
++
++#define RAYTRACER_INTERFACE_VERSION "RayTracer001"
++
++struct RTFrameParams
++{
++	float	m_worldToProjection[16];	// row-major, D3D convention (clip z in 0..1), as from IVRenderView::GetMatricesForView
++	float	m_projectionToWorld[16];	// its inverse
++	float	m_cameraPos[3];
++	float	m_sunDir[3];				// unit vector pointing toward the sun (world space); zero if no sun
++	float	m_flAORadius;				// world units
++	float	m_flAOStrength;				// 0..1
++	float	m_flShadowStrength;			// 0..1
++	float	m_flSunAngleDeg;			// jitter cone half angle
++	int		m_nFrame;
++	int		m_nDebugMode;				// 0 off, 1 AO buffer, 2 shadow buffer, 3 normals, 4 depth
++	int		m_bAO;
++	int		m_bShadows;
++	int		m_nResolutionDivisor;		// 1 = full, 2 = half (default)
++	int		m_nAORays;					// AO rays per pixel per frame
++};
++
++abstract_class IRayTracer
++{
++public:
++	virtual bool Init() = 0;								// any thread, once; false if Metal ray tracing unavailable
++	virtual bool IsAvailable() = 0;
++	// Replaces the world geometry (copied). Triangles in world space; indices are triples.
++	virtual void SetWorldGeometry( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris ) = 0;
++	virtual void ClearWorld() = 0;
++	// Render thread only, GL context current.
++	// CaptureDepth: call right after the 3D scene is drawn (its depth is in the current drawing framebuffer).
++	virtual bool CaptureDepth( int nResolutionDivisor ) = 0;
++	// ApplyAndComposite: call when the final colour is in the current drawing framebuffer; traces using the captured depth.
++	virtual bool ApplyAndComposite( const RTFrameParams &params ) = 0;
++	virtual const char *GetStatus() = 0;
++};
++
++#endif // IRAYTRACER_H
+diff --git a/public/togl/linuxwin/cglmfbo.h b/public/togl/linuxwin/cglmfbo.h
+index 93ebb11..517d39e 100644
+--- a/public/togl/linuxwin/cglmfbo.h
++++ b/public/togl/linuxwin/cglmfbo.h
+@@ -75,6 +75,7 @@ class CGLMFBO
+ 	friend class GLMContext;
+ 	friend class GLMTester;
+ 	friend class CGLMTex;
++	friend class CGLMRayTraceHooks;
+ 
+ 	friend struct IDirect3D9;
+ 	friend struct IDirect3DDevice9;
+diff --git a/public/togl/linuxwin/cglmtex.h b/public/togl/linuxwin/cglmtex.h
+index 5532131..bd32b29 100644
+--- a/public/togl/linuxwin/cglmtex.h
++++ b/public/togl/linuxwin/cglmtex.h
+@@ -471,6 +471,7 @@ protected:
+ 	friend class GLMContext;			// only GLMContext can make CGLMTex objects
+ 	friend class GLMTester;
+ 	friend class CGLMFBO;
++	friend class CGLMRayTraceHooks;
+ 
+ 	friend struct IDirect3DDevice9;
+ 	friend struct IDirect3DBaseTexture9;
+diff --git a/public/togl/linuxwin/glmgr.h b/public/togl/linuxwin/glmgr.h
+index a81ca03..fa7360e 100644
+--- a/public/togl/linuxwin/glmgr.h
++++ b/public/togl/linuxwin/glmgr.h
+@@ -1541,6 +1541,7 @@ class GLMContext
+ 		friend class GLMRendererInfo;	// only GLMgr can make GLMContext objects
+ 		friend class CGLMTex;			// tex needs to be able to do binds
+ 		friend class CGLMFBO;			// fbo needs to be able to do binds
++		friend class CGLMRayTraceHooks;	// ray tracing layer (glmrt.cpp) reads the drawing FBO
+ 		friend class CGLMProgram;
+ 		friend class CGLMShaderPair;
+ 		friend class CGLMShaderPairCache;
+diff --git a/rtmetal/rtmetal.mm b/rtmetal/rtmetal.mm
+new file mode 100644
+index 0000000..3500ccb
+--- /dev/null
++++ b/rtmetal/rtmetal.mm
+@@ -0,0 +1,538 @@
++//========= Ray tracing layer: Metal implementation (macOS arm64 port) ==========
++// Traces ambient occlusion and sun shadow rays against the level geometry using
++// the Metal ray tracing API (software on M1/M2, hardware on M3+), reading the
++// scene depth that togl resolves into an IOSurface and writing a modulation
++// image that togl multiplies onto the frame. See docs/superpowers/specs/
++// 2026-09-09-ray-tracing-design.md in the project repo.
++//=============================================================================
++#import <Metal/Metal.h>
++#import <IOSurface/IOSurface.h>
++#import <Foundation/Foundation.h>
++#include <dlfcn.h>
++#define DONT_DEFINE_BOOL	// Cocoa already has one
++#include <mutex>
++#include <vector>
++#include "rtmetal/iraytracer.h"
++#include "tier0/dbg.h"
++#include "tier1/interface.h"
++
++// togl hooks, resolved at run time
++typedef bool ( *GLMRT_GetBackbufferInfo_t )( int *, int *, int * );
++typedef bool ( *GLMRT_ResolveDepth_t )( void * );
++typedef bool ( *GLMRT_Composite_t )( void *, int, int, int );
++
++static const char *s_pKernels = R"MSL(
++#include <metal_stdlib>
++#include <metal_raytracing>
++using namespace metal;
++using namespace raytracing;
++
++struct Params {
++    float4x4 worldToProj;   // column-major as uploaded (we transpose on CPU)
++    float4x4 projToWorld;
++    float4x4 prevWorldToProj;
++    packed_float3 cameraPos; float aoRadius;   // packed: matches the C struct (float[3] + float)
++    packed_float3 sunDir; float aoStrength;
++    float shadowStrength; float sunCosAngle; int frame; int debugMode;
++    int aoEnabled; int shadowEnabled; int fullW; int fullH;
++    int halfW; int halfH; int hasSun; int historyValid;
++    int aoRays; int pad0; int pad1; int pad2;
++};
++
++// depth packed by togl: hi/mid/lo bytes of a 24-bit depth
++static float unpackDepth(float4 c) {
++    // togl writes GL_BGRA / 8_8_8_8_REV into the surface; Metal reads bgra8Unorm as rgba in that order
++    return (floor(c.r * 255.0 + 0.5) * 65536.0 + floor(c.g * 255.0 + 0.5) * 256.0 + floor(c.b * 255.0 + 0.5)) / 16777215.0;
++}
++
++// Texture row 0 is the GL framebuffer's bottom row; togl renders with Y flipped
++// relative to Source's Direct3D-style projection, so row 0 is the TOP of the
++// projected image: ndc.y = +1 at uv.y = 0.
++static float3 reconstruct(constant Params& p, float2 uv, float d) {
++    float4 ndc = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
++    float4 w = p.projToWorld * ndc;
++    return w.xyz / w.w;
++}
++
++static float readDepth(texture2d<float, access::read> depthTex, int2 px, constant Params& p) {
++    px = clamp(px, int2(0), int2(p.fullW - 1, p.fullH - 1));
++    return unpackDepth(depthTex.read(uint2(px)));
++}
++
++static uint hash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
++static float rnd(thread uint& s) { s = hash(s); return float(s >> 8) * (1.0 / 16777216.0); }
++
++static float3 cosineHemisphere(float3 n, float u1, float u2) {
++    float r = sqrt(u1), phi = 6.28318530718 * u2;
++    float3 t = normalize(cross(abs(n.x) > 0.5 ? float3(0,1,0) : float3(1,0,0), n));
++    float3 b = cross(n, t);
++    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
++}
++
++// half-res: raw visibility (R = ao, G = sun), linear depth in B, normal encoded? keep B=view distance, A = valid
++kernel void trace(constant Params& p [[buffer(0)]],
++                  primitive_acceleration_structure accel [[buffer(1)]],
++                  texture2d<float, access::read> depthTex [[texture(0)]],
++                  texture2d<float, access::write> rawTex [[texture(1)]],
++                  texture2d<float, access::write> normalTex [[texture(2)]],
++                  uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= (uint)p.halfW || gid.y >= (uint)p.halfH) return;
++    int div = p.fullW / p.halfW;
++    int2 px = int2(gid) * div + div / 2;
++    float d = readDepth(depthTex, px, p);
++    if (d >= 0.99999) { rawTex.write(float4(1, 1, 0, 0), gid); normalTex.write(float4(0,0,0,0), gid); return; }
++    float2 uv = (float2(px) + 0.5) / float2(p.fullW, p.fullH);
++    float3 P = reconstruct(p, uv, d);
++    // normal from the depth neighbourhood: pick the neighbour pair with the smaller depth discontinuity
++    float2 texel = float2(div) / float2(p.fullW, p.fullH);
++    float dl = readDepth(depthTex, px - int2(div, 0), p), dr = readDepth(depthTex, px + int2(div, 0), p);
++    float dd = readDepth(depthTex, px - int2(0, div), p), du = readDepth(depthTex, px + int2(0, div), p);
++    float3 Px = (abs(dr - d) < abs(dl - d)) ? reconstruct(p, uv + float2(texel.x, 0), dr) - P : P - reconstruct(p, uv - float2(texel.x, 0), dl);
++    float3 Py = (abs(du - d) < abs(dd - d)) ? reconstruct(p, uv + float2(0, texel.y), du) - P : P - reconstruct(p, uv - float2(0, texel.y), dd);
++    float3 N = normalize(cross(Px, Py));
++    float3 V = normalize(float3(p.cameraPos) - P);
++    if (dot(N, V) < 0.0) N = -N;
++    float dist = length(float3(p.cameraPos) - P);
++    float bias = 0.5 + dist * 0.002;
++    float3 origin = P + N * bias;
++
++    intersector<triangle_data> isect;
++    isect.set_triangle_cull_mode(triangle_cull_mode::none);
++    isect.assume_geometry_type(geometry_type::triangle);
++    uint seed = hash(gid.x * 1973u + gid.y * 9277u + uint(p.frame) * 26699u);
++
++    float ao = 1.0;
++    if (p.aoEnabled) {
++        float sum = 0.0;
++        int n = max(p.aoRays, 1);
++        for (int i = 0; i < n; i++) {
++            float3 dir = cosineHemisphere(N, rnd(seed), rnd(seed));
++            ray r; r.origin = origin; r.direction = dir; r.min_distance = 0.0; r.max_distance = p.aoRadius;
++            intersection_result<triangle_data> res = isect.intersect(r, accel);
++            float v = 1.0;
++            if (res.type != intersection_type::none) {
++                // distance-weighted occlusion
++                v = clamp(res.distance / p.aoRadius, 0.0, 1.0);
++                v = v * v;
++            }
++            sum += v;
++        }
++        ao = sum / float(n);
++    }
++    float sun = 1.0;
++    if (p.shadowEnabled && p.hasSun) {
++        float3 sunDir = float3(p.sunDir);
++        float ndl = dot(N, sunDir);
++        if (ndl > 0.0) {
++            // jitter within the cone
++            float3 t = normalize(cross(abs(sunDir.x) > 0.5 ? float3(0,1,0) : float3(1,0,0), sunDir));
++            float3 b = cross(sunDir, t);
++            float u1 = rnd(seed), u2 = rnd(seed);
++            float cosA = mix(p.sunCosAngle, 1.0, u1), sinA = sqrt(1.0 - cosA * cosA), phi = 6.28318530718 * u2;
++            float3 dir = normalize(sunDir * cosA + t * (sinA * cos(phi)) + b * (sinA * sin(phi)));
++            ray r; r.origin = origin; r.direction = dir; r.min_distance = 0.0; r.max_distance = 16384.0;
++            intersection_result<triangle_data> res = isect.intersect(r, accel);
++            if (res.type != intersection_type::none) sun = 0.0;
++        }
++    }
++    rawTex.write(float4(ao, sun, dist, 1.0), gid);
++    normalTex.write(float4(N, 1.0), gid);
++}
++
++// temporal accumulation with reprojection; history: R ao, G sun, B dist, A sample count
++kernel void temporal(constant Params& p [[buffer(0)]],
++                     texture2d<float, access::read> rawTex [[texture(0)]],
++                     texture2d<float, access::read> depthTex [[texture(1)]],
++                     texture2d<float, access::sample> historyTex [[texture(2)]],
++                     texture2d<float, access::write> outTex [[texture(3)]],
++                     uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= (uint)p.halfW || gid.y >= (uint)p.halfH) return;
++    float4 raw = rawTex.read(gid);
++    if (raw.a == 0.0) { outTex.write(float4(1, 1, 0, 0), gid); return; }
++    int div = p.fullW / p.halfW;
++    int2 px = int2(gid) * div + div / 2;
++    float d = readDepth(depthTex, px, p);
++    float2 uv = (float2(px) + 0.5) / float2(p.fullW, p.fullH);
++    float3 P = reconstruct(p, uv, d);
++    float count = 0.0; float2 acc = raw.rg;
++    if (p.historyValid) {
++        float4 prev = p.prevWorldToProj * float4(P, 1.0);
++        if (prev.w > 0.0) {
++            float2 pndc = prev.xy / prev.w;
++            float2 puv = float2(pndc.x * 0.5 + 0.5, 0.5 - pndc.y * 0.5);
++            if (all(puv >= 0.0) && all(puv <= 1.0)) {
++                constexpr sampler s(filter::linear, address::clamp_to_edge);
++                float4 h = historyTex.sample(s, puv);
++                float prevDist = h.b;
++                float tol = 0.02 * max(raw.b, 1.0) + 2.0;
++                if (abs(prevDist - raw.b) < tol * 4.0 && h.a > 0.0) {
++                    count = min(h.a, 31.0);
++                    float w = 1.0 / (count + 1.0);
++                    acc = mix(h.rg, raw.rg, w);
++                }
++            }
++        }
++    }
++    outTex.write(float4(acc, raw.b, count + 1.0), gid);
++}
++
++// depth-aware 5x5 blur on the accumulated half-res buffer
++kernel void blur(constant Params& p [[buffer(0)]],
++                 texture2d<float, access::read> inTex [[texture(0)]],
++                 texture2d<float, access::read> normalTex [[texture(1)]],
++                 texture2d<float, access::write> outTex [[texture(2)]],
++                 uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= (uint)p.halfW || gid.y >= (uint)p.halfH) return;
++    float4 c = inTex.read(gid);
++    if (c.a == 0.0) { outTex.write(c, gid); return; }
++    float3 n = normalTex.read(gid).xyz;
++    // fewer samples once the history has converged
++    int radius = c.a >= 16.0 ? 1 : 2;
++    float2 sum = 0.0; float wsum = 0.0;
++    for (int dy = -radius; dy <= radius; dy++) for (int dx = -radius; dx <= radius; dx++) {
++        int2 q = clamp(int2(gid) + int2(dx, dy), int2(0), int2(p.halfW - 1, p.halfH - 1));
++        float4 s = inTex.read(uint2(q));
++        if (s.a == 0.0) continue;
++        float3 sn = normalTex.read(uint2(q)).xyz;
++        float w = exp(-abs(s.b - c.b) / (0.05 * c.b + 1.0)) * max(0.0, dot(n, sn));
++        sum += s.rg * w; wsum += w;
++    }
++    outTex.write(float4(wsum > 0.0 ? sum / wsum : c.rg, c.b, c.a), gid);
++}
++
++// full-res output: modulation colour (or a debug view), depth-aware upsample from half-res
++kernel void composite(constant Params& p [[buffer(0)]],
++                      texture2d<float, access::read> filteredTex [[texture(0)]],
++                      texture2d<float, access::read> depthTex [[texture(1)]],
++                      texture2d<float, access::read> normalTex [[texture(2)]],
++                      texture2d<float, access::write> resultTex [[texture(3)]],
++                      uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= (uint)p.fullW || gid.y >= (uint)p.fullH) return;
++    int div = p.fullW / p.halfW;
++    int2 h = clamp(int2(gid) / div, int2(0), int2(p.halfW - 1, p.halfH - 1));
++    float d = unpackDepth(depthTex.read(gid));
++    float4 out = float4(1.0);
++    if (d < 0.99999) {
++        float2 uv = (float2(gid) + 0.5) / float2(p.fullW, p.fullH);
++        float dist = length(float3(p.cameraPos) - reconstruct(p, uv, d));
++        // nearest of the 2x2 half-res neighbours by distance
++        float2 best = float2(1.0); float bestErr = 1e30;
++        for (int dy = 0; dy <= 1; dy++) for (int dx = 0; dx <= 1; dx++) {
++            int2 q = clamp(h + int2(dx, dy) - int2((int(gid.x) % div) < div/2 ? 1 : 0, (int(gid.y) % div) < div/2 ? 1 : 0), int2(0), int2(p.halfW - 1, p.halfH - 1));
++            float4 s = filteredTex.read(uint2(q));
++            if (s.a == 0.0) continue;
++            float err = abs(s.b - dist);
++            if (err < bestErr) { bestErr = err; best = s.rg; }
++        }
++        float ao = mix(1.0, best.r, p.aoStrength);
++        float sun = mix(1.0, best.g, p.shadowStrength);
++        out = float4(ao * sun, ao * sun, ao * sun, 1.0);
++        if (p.debugMode == 1) out = float4(best.r, best.r, best.r, 1.0);
++        else if (p.debugMode == 2) out = float4(best.g, best.g, best.g, 1.0);
++        else if (p.debugMode == 3) { float3 n = normalTex.read(uint2(h)).xyz; out = float4(n * 0.5 + 0.5, 1.0); }
++        else if (p.debugMode == 4) { float v = saturate(dist / 2048.0); out = float4(v, v, v, 1.0); }
++        else if (p.debugMode == 5) { float v = (d - 0.9) * 10.0; out = float4(saturate(v), saturate(v), saturate(v), 1.0); }
++        else if (p.debugMode == 6) { float3 P = reconstruct(p, uv, d); out = float4(fract(P / 256.0), 1.0); }
++    } else if (p.debugMode != 0) {
++        out = float4(0.0, 0.0, 0.0, 1.0);
++    }
++    resultTex.write(out, gid);
++}
++)MSL";
++
++struct RTParamsGPU
++{
++	float worldToProj[16]; float projToWorld[16]; float prevWorldToProj[16];
++	float cameraPos[3]; float aoRadius;
++	float sunDir[3]; float aoStrength;
++	float shadowStrength; float sunCosAngle; int frame; int debugMode;
++	int aoEnabled; int shadowEnabled; int fullW; int fullH;
++	int halfW; int halfH; int hasSun; int historyValid;
++	int aoRays; int pad0; int pad1; int pad2;
++};
++
++class CRayTracerMetal : public IRayTracer
++{
++public:
++	CRayTracerMetal() : m_bInit( false ), m_bAvailable( false ), m_pDevice( nil ), m_pQueue( nil ), m_pAccel( nil ), m_pPendingAccel( nil ),
++		m_depthSurface( NULL ), m_resultSurface( NULL ), m_nFullW( 0 ), m_nFullH( 0 ), m_nHalfW( 0 ), m_nHalfH( 0 ), m_nHistoryIndex( 0 ), m_bHistoryValid( false ),
++		m_pfnGetBackbufferInfo( NULL ), m_pfnResolveDepth( NULL ), m_pfnComposite( NULL ), m_bDepthCaptured( false ), m_flTimeResolve( 0 ), m_flTimeMetalWall( 0 ), m_flTimeMetalGPU( 0 ), m_flTimeComposite( 0 ), m_nTimedFrames( 0 ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; }
++
++	virtual bool Init() OVERRIDE;
++	virtual bool IsAvailable() OVERRIDE { return m_bAvailable; }
++	virtual void SetWorldGeometry( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris ) OVERRIDE;
++	virtual void ClearWorld() OVERRIDE;
++	virtual bool CaptureDepth( int nResolutionDivisor ) OVERRIDE;
++	virtual bool ApplyAndComposite( const RTFrameParams &params ) OVERRIDE;
++	virtual const char *GetStatus() OVERRIDE { snprintf( m_szStatusFull, sizeof( m_szStatusFull ), "%s; %s", m_szStatus, m_szTiming ); return m_szStatusFull; }
++	bool m_bDepthCaptured;
++	double m_flTimeResolve, m_flTimeMetalWall, m_flTimeMetalGPU, m_flTimeComposite; int m_nTimedFrames; char m_szTiming[256]; char m_szStatusFull[512];
++
++private:
++	bool EnsureTargets( int w, int h, int divisor );
++	void SetStatus( const char *fmt, ... );
++
++	bool m_bInit, m_bAvailable;
++	id<MTLDevice> m_pDevice;
++	id<MTLCommandQueue> m_pQueue;
++	id<MTLComputePipelineState> m_pTrace, m_pTemporal, m_pBlur, m_pComposite;
++	std::mutex m_accelMutex;
++	id<MTLAccelerationStructure> m_pAccel, m_pPendingAccel;
++	id<MTLBuffer> m_pVertexBuffer, m_pIndexBuffer;	// keep alive while the structure references them
++	IOSurfaceRef m_depthSurface, m_resultSurface;
++	id<MTLTexture> m_pDepthTex, m_pResultTex, m_pRawTex, m_pNormalTex, m_pFilteredTex, m_pHistory[2];
++	int m_nFullW, m_nFullH, m_nHalfW, m_nHalfH, m_nHistoryIndex;
++	bool m_bHistoryValid;
++	float m_prevWorldToProj[16];
++	GLMRT_GetBackbufferInfo_t m_pfnGetBackbufferInfo;
++	GLMRT_ResolveDepth_t m_pfnResolveDepth;
++	GLMRT_Composite_t m_pfnComposite;
++	char m_szStatus[256];
++};
++
++void CRayTracerMetal::SetStatus( const char *fmt, ... )
++{
++	va_list ap; va_start( ap, fmt ); vsnprintf( m_szStatus, sizeof( m_szStatus ), fmt, ap ); va_end( ap );
++	Msg( "[rt] %s\n", m_szStatus );
++}
++
++bool CRayTracerMetal::Init()
++{
++	if ( m_bInit )
++		return m_bAvailable;
++	m_bInit = true;
++	@autoreleasepool
++	{
++		m_pDevice = [MTLCreateSystemDefaultDevice() retain];
++		if ( !m_pDevice ) { SetStatus( "no Metal device" ); return false; }
++		if ( ![m_pDevice supportsRaytracing] ) { SetStatus( "%s does not support Metal ray tracing", [[m_pDevice name] UTF8String] ); return false; }
++		m_pQueue = [[m_pDevice newCommandQueue] retain];
++		NSError *err = nil;
++		id<MTLLibrary> lib = [m_pDevice newLibraryWithSource:[NSString stringWithUTF8String:s_pKernels] options:nil error:&err];
++		if ( !lib ) { SetStatus( "kernel compile failed: %s", [[err localizedDescription] UTF8String] ); return false; }
++		struct { const char *name; id<MTLComputePipelineState> *out; } kernels[] = {
++			{ "trace", &m_pTrace }, { "temporal", &m_pTemporal }, { "blur", &m_pBlur }, { "composite", &m_pComposite } };
++		for ( auto &k : kernels )
++		{
++			id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:k.name]];
++			*k.out = [[m_pDevice newComputePipelineStateWithFunction:fn error:&err] retain];
++			[fn release];
++			if ( !*k.out ) { SetStatus( "pipeline %s failed: %s", k.name, [[err localizedDescription] UTF8String] ); [lib release]; return false; }
++		}
++		[lib release];
++		m_pfnGetBackbufferInfo = (GLMRT_GetBackbufferInfo_t)dlsym( RTLD_DEFAULT, "GLMRT_GetBackbufferInfo" );
++		m_pfnResolveDepth = (GLMRT_ResolveDepth_t)dlsym( RTLD_DEFAULT, "GLMRT_ResolveDepth" );
++		m_pfnComposite = (GLMRT_Composite_t)dlsym( RTLD_DEFAULT, "GLMRT_Composite" );
++		if ( !m_pfnGetBackbufferInfo || !m_pfnResolveDepth || !m_pfnComposite ) { SetStatus( "togl hooks not found (libtogl.dylib without glmrt)" ); return false; }
++		m_bAvailable = true;
++		SetStatus( "ready on %s (%s ray tracing)", [[m_pDevice name] UTF8String], [m_pDevice supportsFamily:MTLGPUFamilyApple9] ? "hardware" : "software" );
++	}
++	return true;
++}
++
++void CRayTracerMetal::SetWorldGeometry( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris )
++{
++	if ( !m_bAvailable || nTris <= 0 || nVerts <= 0 )
++		return;
++	@autoreleasepool
++	{
++		double t0 = CFAbsoluteTimeGetCurrent();
++		// pad float3 to 16 bytes for the vertex stride Metal prefers
++		std::vector<float> padded( (size_t)nVerts * 4 );
++		for ( int i = 0; i < nVerts; i++ ) { padded[i*4] = pVertsXYZ[i*3]; padded[i*4+1] = pVertsXYZ[i*3+1]; padded[i*4+2] = pVertsXYZ[i*3+2]; padded[i*4+3] = 0; }
++		id<MTLBuffer> vb = [m_pDevice newBufferWithBytes:padded.data() length:padded.size() * sizeof( float ) options:MTLResourceStorageModeShared];
++		id<MTLBuffer> ib = [m_pDevice newBufferWithBytes:pIndices length:(size_t)nTris * 3 * sizeof( unsigned int ) options:MTLResourceStorageModeShared];
++		MTLAccelerationStructureTriangleGeometryDescriptor *geom = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
++		geom.vertexBuffer = vb; geom.vertexStride = 16; geom.vertexFormat = MTLAttributeFormatFloat3;
++		geom.indexBuffer = ib; geom.indexType = MTLIndexTypeUInt32; geom.triangleCount = nTris;
++		geom.opaque = YES;
++		MTLPrimitiveAccelerationStructureDescriptor *desc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
++		desc.geometryDescriptors = @[ geom ];
++		MTLAccelerationStructureSizes sizes = [m_pDevice accelerationStructureSizesWithDescriptor:desc];
++		id<MTLAccelerationStructure> accel = [m_pDevice newAccelerationStructureWithSize:sizes.accelerationStructureSize];
++		id<MTLBuffer> scratch = [m_pDevice newBufferWithLength:sizes.buildScratchBufferSize options:MTLResourceStorageModePrivate];
++		id<MTLCommandBuffer> cb = [m_pQueue commandBuffer];
++		id<MTLAccelerationStructureCommandEncoder> enc = [cb accelerationStructureCommandEncoder];
++		[enc buildAccelerationStructure:accel descriptor:desc scratchBuffer:scratch scratchBufferOffset:0];
++		[enc endEncoding];
++		[cb commit];
++		[cb waitUntilCompleted];
++		[scratch release];
++		{
++			std::lock_guard<std::mutex> lock( m_accelMutex );
++			if ( m_pPendingAccel ) [m_pPendingAccel release];
++			m_pPendingAccel = [accel retain];
++			// buffers are swapped in on the render thread together with the structure
++			[m_pVertexBuffer release]; [m_pIndexBuffer release];
++			m_pVertexBuffer = [vb retain]; m_pIndexBuffer = [ib retain];
++		}
++		[accel release]; [vb release]; [ib release];
++		SetStatus( "world: %d triangles, BVH built in %.0f ms", nTris, ( CFAbsoluteTimeGetCurrent() - t0 ) * 1000.0 );
++	}
++}
++
++void CRayTracerMetal::ClearWorld()
++{
++	std::lock_guard<std::mutex> lock( m_accelMutex );
++	if ( m_pAccel ) { [m_pAccel release]; m_pAccel = nil; }
++	if ( m_pPendingAccel ) { [m_pPendingAccel release]; m_pPendingAccel = nil; }
++	m_bHistoryValid = false;
++}
++
++static id<MTLTexture> MakeTex( id<MTLDevice> dev, MTLPixelFormat fmt, int w, int h, IOSurfaceRef surface )
++{
++	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:NO];
++	td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
++	td.storageMode = MTLStorageModePrivate;
++	if ( surface )
++	{
++		td.storageMode = MTLStorageModeShared;
++		return [dev newTextureWithDescriptor:td iosurface:surface plane:0];
++	}
++	return [dev newTextureWithDescriptor:td];
++}
++
++bool CRayTracerMetal::EnsureTargets( int w, int h, int divisor )
++{
++	int hw = w / divisor, hh = h / divisor;
++	if ( m_nFullW == w && m_nFullH == h && m_nHalfW == hw && m_nHalfH == hh && m_depthSurface && m_resultSurface )
++		return true;
++	@autoreleasepool
++	{
++		[m_pDepthTex release]; [m_pResultTex release]; [m_pRawTex release]; [m_pNormalTex release]; [m_pFilteredTex release]; [m_pHistory[0] release]; [m_pHistory[1] release];
++		if ( m_depthSurface ) CFRelease( m_depthSurface );
++		if ( m_resultSurface ) CFRelease( m_resultSurface );
++		NSDictionary *props = @{ (id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfacePixelFormat: @(0x42475241) };
++		m_depthSurface = IOSurfaceCreate( (CFDictionaryRef)props );
++		m_resultSurface = IOSurfaceCreate( (CFDictionaryRef)props );
++		if ( !m_depthSurface || !m_resultSurface ) { SetStatus( "IOSurface creation failed" ); return false; }
++		m_pDepthTex = MakeTex( m_pDevice, MTLPixelFormatBGRA8Unorm, w, h, m_depthSurface );
++		m_pResultTex = MakeTex( m_pDevice, MTLPixelFormatBGRA8Unorm, w, h, m_resultSurface );
++		m_pRawTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
++		m_pNormalTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
++		m_pFilteredTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
++		m_pHistory[0] = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
++		m_pHistory[1] = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
++		m_nFullW = w; m_nFullH = h; m_nHalfW = hw; m_nHalfH = hh;
++		m_bHistoryValid = false;
++		SetStatus( "targets %dx%d (trace %dx%d)", w, h, hw, hh );
++	}
++	return true;
++}
++
++static void Transpose16( const float *in, float *out )
++{
++	// Source VMatrix is row-major (m[row][col]); Metal float4x4 constant is column-major
++	for ( int r = 0; r < 4; r++ ) for ( int c = 0; c < 4; c++ ) out[c*4 + r] = in[r*4 + c];
++}
++
++bool CRayTracerMetal::CaptureDepth( int nResolutionDivisor )
++{
++	m_bDepthCaptured = false;
++	if ( !m_bAvailable )
++		return false;
++	int w = 0, h = 0, msaa = 0;
++	if ( !m_pfnGetBackbufferInfo( &w, &h, &msaa ) || w <= 0 || h <= 0 )
++		return false;
++	int divisor = nResolutionDivisor >= 1 ? nResolutionDivisor : 2;
++	if ( !EnsureTargets( w, h, divisor ) )
++		return false;
++	double t0 = CFAbsoluteTimeGetCurrent();
++	m_bDepthCaptured = m_pfnResolveDepth( m_depthSurface );
++	m_flTimeResolve += ( CFAbsoluteTimeGetCurrent() - t0 ) * 1000.0;
++	return m_bDepthCaptured;
++}
++
++bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
++{
++	if ( !m_bAvailable || !m_bDepthCaptured )
++		return false;
++	m_bDepthCaptured = false;
++	{
++		std::lock_guard<std::mutex> lock( m_accelMutex );
++		if ( m_pPendingAccel )
++		{
++			[m_pAccel release];
++			m_pAccel = m_pPendingAccel;
++			m_pPendingAccel = nil;
++			m_bHistoryValid = false;
++		}
++	}
++	if ( !m_pAccel )
++		return false;
++
++	@autoreleasepool
++	{
++		RTParamsGPU gp;
++		memset( &gp, 0, sizeof( gp ) );
++		Transpose16( params.m_worldToProjection, gp.worldToProj );
++		Transpose16( params.m_projectionToWorld, gp.projToWorld );
++		Transpose16( m_prevWorldToProj, gp.prevWorldToProj );
++		memcpy( gp.cameraPos, params.m_cameraPos, sizeof( gp.cameraPos ) );
++		memcpy( gp.sunDir, params.m_sunDir, sizeof( gp.sunDir ) );
++		gp.aoRadius = params.m_flAORadius > 1.0f ? params.m_flAORadius : 1.0f;
++		gp.aoStrength = params.m_flAOStrength; gp.shadowStrength = params.m_flShadowStrength;
++		gp.sunCosAngle = cosf( params.m_flSunAngleDeg * 3.14159265f / 180.0f );
++		gp.frame = params.m_nFrame; gp.debugMode = params.m_nDebugMode;
++		gp.aoEnabled = params.m_bAO; gp.shadowEnabled = params.m_bShadows;
++		gp.fullW = m_nFullW; gp.fullH = m_nFullH; gp.halfW = m_nHalfW; gp.halfH = m_nHalfH;
++		float sunLen = sqrtf( params.m_sunDir[0]*params.m_sunDir[0] + params.m_sunDir[1]*params.m_sunDir[1] + params.m_sunDir[2]*params.m_sunDir[2] );
++		gp.hasSun = sunLen > 0.5f;
++		gp.historyValid = m_bHistoryValid;
++		gp.aoRays = params.m_nAORays > 0 ? params.m_nAORays : 1;
++
++		double t0 = CFAbsoluteTimeGetCurrent();
++		id<MTLTexture> histIn = m_pHistory[m_nHistoryIndex], histOut = m_pHistory[m_nHistoryIndex ^ 1];
++		id<MTLCommandBuffer> cb = [m_pQueue commandBuffer];
++		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
++		MTLSize tg = MTLSizeMake( 8, 8, 1 );
++		MTLSize halfGrid = MTLSizeMake( m_nHalfW, m_nHalfH, 1 ), fullGrid = MTLSizeMake( m_nFullW, m_nFullH, 1 );
++
++		[ce setComputePipelineState:m_pTrace];
++		[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
++		[ce setAccelerationStructure:m_pAccel atBufferIndex:1];
++		[ce setTexture:m_pDepthTex atIndex:0]; [ce setTexture:m_pRawTex atIndex:1]; [ce setTexture:m_pNormalTex atIndex:2];
++		[ce dispatchThreads:halfGrid threadsPerThreadgroup:tg];
++
++		[ce setComputePipelineState:m_pTemporal];
++		[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
++		[ce setTexture:m_pRawTex atIndex:0]; [ce setTexture:m_pDepthTex atIndex:1]; [ce setTexture:histIn atIndex:2]; [ce setTexture:histOut atIndex:3];
++		[ce dispatchThreads:halfGrid threadsPerThreadgroup:tg];
++
++		[ce setComputePipelineState:m_pBlur];
++		[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
++		[ce setTexture:histOut atIndex:0]; [ce setTexture:m_pNormalTex atIndex:1]; [ce setTexture:m_pFilteredTex atIndex:2];
++		[ce dispatchThreads:halfGrid threadsPerThreadgroup:tg];
++
++		[ce setComputePipelineState:m_pComposite];
++		[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
++		[ce setTexture:m_pFilteredTex atIndex:0]; [ce setTexture:m_pDepthTex atIndex:1]; [ce setTexture:m_pNormalTex atIndex:2]; [ce setTexture:m_pResultTex atIndex:3];
++		[ce dispatchThreads:fullGrid threadsPerThreadgroup:tg];
++		[ce endEncoding];
++		[cb commit];
++		[cb waitUntilCompleted];
++		m_flTimeMetalGPU += ( cb.GPUEndTime - cb.GPUStartTime ) * 1000.0;
++		m_flTimeMetalWall += ( CFAbsoluteTimeGetCurrent() - t0 ) * 1000.0;
++
++		m_nHistoryIndex ^= 1;
++		m_bHistoryValid = true;
++		memcpy( m_prevWorldToProj, params.m_worldToProjection, sizeof( m_prevWorldToProj ) );
++	}
++	double t1 = CFAbsoluteTimeGetCurrent();
++	bool bOK = m_pfnComposite( m_resultSurface, m_nFullW, m_nFullH, params.m_nDebugMode != 0 );
++	m_flTimeComposite += ( CFAbsoluteTimeGetCurrent() - t1 ) * 1000.0;
++	if ( ++m_nTimedFrames >= 120 )
++	{
++		snprintf( m_szTiming, sizeof( m_szTiming ), "per frame: depth resolve %.2f ms, metal %.2f ms wall (%.2f ms GPU), composite %.2f ms; trace %dx%d",
++			m_flTimeResolve / m_nTimedFrames, m_flTimeMetalWall / m_nTimedFrames, m_flTimeMetalGPU / m_nTimedFrames, m_flTimeComposite / m_nTimedFrames, m_nHalfW, m_nHalfH );
++		m_flTimeResolve = m_flTimeMetalWall = m_flTimeMetalGPU = m_flTimeComposite = 0.0; m_nTimedFrames = 0;
++	}
++	return bOK;
++}
++
++static CRayTracerMetal s_RayTracer;
++EXPOSE_SINGLE_INTERFACE_GLOBALVAR( CRayTracerMetal, IRayTracer, RAYTRACER_INTERFACE_VERSION, s_RayTracer );
+diff --git a/rtmetal/wscript b/rtmetal/wscript
+new file mode 100644
+index 0000000..96cc577
+--- /dev/null
++++ b/rtmetal/wscript
+@@ -0,0 +1,36 @@
++#! /usr/bin/env python
++# encoding: utf-8
++
++top = '.'
++PROJECT_NAME = 'rtmetal'
++
++def options(opt):
++	return
++
++def configure(conf):
++	return
++
++def build(bld):
++	source = [
++		'rtmetal.mm',
++		'../public/tier0/memoverride.cpp'
++	]
++	includes = [
++		'.',
++		'../public',
++		'../public/tier0',
++		'../public/tier1',
++	]
++	libs = ['tier0','tier1', 'METAL', 'IOSURFACE', 'FOUNDATION', 'QUARTZCORE']
++	bld.shlib(
++		source   = source,
++		target   = PROJECT_NAME,
++		name     = PROJECT_NAME,
++		features = 'c cxx',
++		includes = includes,
++		defines  = [],
++		use      = libs,
++		install_path = bld.env.LIBDIR,
++		subsystem = bld.env.MSVC_SUBSYSTEM,
++		idx      = bld.get_taskgen_count()
++	)
+diff --git a/togl/linuxwin/dxabstract.cpp b/togl/linuxwin/dxabstract.cpp
+index 4510094..e59a544 100644
+--- a/togl/linuxwin/dxabstract.cpp
++++ b/togl/linuxwin/dxabstract.cpp
+@@ -3228,6 +3228,7 @@ void IDirect3DDevice9::UpdateBoundFBO()
+ 
+ 		Assert( nNumBound );
+ 
++
+ #if GLMDEBUG
+ 		Assert( newFBO->IsReady() );
+ #endif
+diff --git a/togl/linuxwin/glmgr.cpp b/togl/linuxwin/glmgr.cpp
+index 745862b..bdbe619 100644
+--- a/togl/linuxwin/glmgr.cpp
++++ b/togl/linuxwin/glmgr.cpp
+@@ -2452,8 +2452,11 @@ static uint gPersistentBufferSize[kGLMNumBufferTypes] =
+ 	0,					// kGLMPixelBuffer
+ };
+ 
++GLMContext *g_pGLMRTContext = NULL;	// the context the ray tracing hooks (glmrt.cpp) operate on
++
+ GLMContext::GLMContext( IDirect3DDevice9 *pDevice, GLMDisplayParams *params )
+ {
++	g_pGLMRTContext = this;
+ 	m_nNumDirtySamplers = 0;
+ // 	m_bUseSamplerObjects = true;
+ // 	
+diff --git a/togl/linuxwin/glmrt.cpp b/togl/linuxwin/glmrt.cpp
+new file mode 100644
+index 0000000..9483d25
+--- /dev/null
++++ b/togl/linuxwin/glmrt.cpp
+@@ -0,0 +1,341 @@
++//========= Ray tracing layer: GL side hooks (macOS arm64 port) =================
++//
++// Exposes the current drawing framebuffer's depth to the Metal ray tracer via an
++// IOSurface-backed texture, and composites the tracer's result back onto the
++// framebuffer. Everything here runs on the render thread with togl's GL context
++// current. GLSL is compiled directly (no Direct3D bytecode involved).
++//
++// Exported C entry points (looked up with dlsym by librtmetal.dylib):
++//   GLMRT_GetBackbufferInfo( int *w, int *h, int *msaa )
++//   GLMRT_ResolveDepth( IOSurfaceRef depthSurface )          // packs 24-bit depth into RGBA8
++//   GLMRT_Composite( IOSurfaceRef resultSurface, int rw, int rh ) // multiplies result onto backbuffer
++//=============================================================================
++#include "togl/rendermechanism.h"
++#include "togl/linuxwin/cglmfbo.h"
++#include "tier0/dbg.h"
++
++#ifdef OSX
++#include <OpenGL/OpenGL.h>
++#include <OpenGL/gl.h>
++#include <OpenGL/glext.h>
++#include <OpenGL/CGLIOSurface.h>
++#include <IOSurface/IOSurface.h>
++
++class CGLMRayTraceHooks
++{
++public:
++	static bool GetBackbufferInfo( int *pWidth, int *pHeight, int *pMSAA );
++	static bool ResolveDepth( IOSurfaceRef depthSurface );
++	static bool Composite( IOSurfaceRef resultSurface, int nResultWidth, int nResultHeight, bool bReplace );
++
++private:
++	static bool GetDrawingFBO( CGLMFBO **ppFBO, CGLMTex **ppDepthTex );
++	static GLuint SurfaceTexture( IOSurfaceRef surface, GLuint *pCachedName, IOSurfaceRef *pCachedSurface, int *pCachedW, int *pCachedH );
++	static GLuint BuildProgram( const char *pVertex, const char *pFragment );
++	static void DrawFullscreenQuad();
++
++	struct SavedState
++	{
++		GLint program, readFBO, drawFBO, arrayBuffer, activeTexture;
++	};
++	static void SaveState( SavedState &s );
++	static void RestoreState( const SavedState &s );
++
++	// resolve resources
++	static GLuint s_depthResolveFBO, s_depthResolveTex; static int s_depthResolveW, s_depthResolveH; static GLenum s_depthResolveIntFormat;
++	static GLuint s_depthPackFBO, s_depthPackTexName; static IOSurfaceRef s_depthPackSurface; static int s_depthPackW, s_depthPackH;
++	static GLuint s_packProgram, s_packProgramRect;
++	// composite resources
++	static GLuint s_resultTexName; static IOSurfaceRef s_resultSurface; static int s_resultW, s_resultH;
++	static GLuint s_compositeProgram;
++	static bool s_bFailed;
++};
++
++GLuint CGLMRayTraceHooks::s_depthResolveFBO = 0; GLuint CGLMRayTraceHooks::s_depthResolveTex = 0; int CGLMRayTraceHooks::s_depthResolveW = 0; int CGLMRayTraceHooks::s_depthResolveH = 0; GLenum CGLMRayTraceHooks::s_depthResolveIntFormat = 0;
++GLuint CGLMRayTraceHooks::s_depthPackFBO = 0; GLuint CGLMRayTraceHooks::s_depthPackTexName = 0; IOSurfaceRef CGLMRayTraceHooks::s_depthPackSurface = NULL; int CGLMRayTraceHooks::s_depthPackW = 0; int CGLMRayTraceHooks::s_depthPackH = 0;
++GLuint CGLMRayTraceHooks::s_packProgram = 0; GLuint CGLMRayTraceHooks::s_packProgramRect = 0;
++GLuint CGLMRayTraceHooks::s_resultTexName = 0; IOSurfaceRef CGLMRayTraceHooks::s_resultSurface = NULL; int CGLMRayTraceHooks::s_resultW = 0; int CGLMRayTraceHooks::s_resultH = 0;
++GLuint CGLMRayTraceHooks::s_compositeProgram = 0;
++bool CGLMRayTraceHooks::s_bFailed = false;
++
++static const char *s_pQuadVertexShader =
++	"#version 120\n"
++	"varying vec2 uv;\n"
++	"void main() { gl_Position = gl_Vertex; uv = gl_Vertex.xy * 0.5 + 0.5; }\n";
++
++// Packs the 24-bit depth into RGB bytes (hi, mid, lo); alpha unused.
++static const char *s_pPackFragmentShader =
++	"#version 120\n"
++	"varying vec2 uv;\n"
++	"uniform sampler2D depthTex;\n"
++	"void main() {\n"
++	"  float d = texture2D( depthTex, uv ).r;\n"
++	"  float v = floor( clamp( d, 0.0, 1.0 ) * 16777215.0 );\n"
++	"  float hi = floor( v / 65536.0 );\n"
++	"  float mid = floor( ( v - hi * 65536.0 ) / 256.0 );\n"
++	"  float lo = v - hi * 65536.0 - mid * 256.0;\n"
++	"  gl_FragColor = vec4( hi / 255.0, mid / 255.0, lo / 255.0, 1.0 );\n"
++	"}\n";
++
++// Result is an RGBA8 rectangle texture holding the modulation colour computed by Metal.
++static const char *s_pCompositeFragmentShader =
++	"#version 120\n"
++	"#extension GL_ARB_texture_rectangle : enable\n"
++	"varying vec2 uv;\n"
++	"uniform sampler2DRect resultTex;\n"
++	"uniform vec2 resultSize;\n"
++	"void main() { gl_FragColor = vec4( texture2DRect( resultTex, uv * resultSize ).rgb, 1.0 ); }\n";
++
++extern GLMContext *g_pGLMRTContext;
++
++bool CGLMRayTraceHooks::GetDrawingFBO( CGLMFBO **ppFBO, CGLMTex **ppDepthTex )
++{
++	GLMContext *ctx = g_pGLMRTContext;
++	if ( !ctx )
++		return false;
++	CGLMFBO *fbo = ctx->m_drawingFBO ? ctx->m_drawingFBO : ctx->m_boundDrawFBO;
++	if ( !fbo )
++		return false;
++	CGLMTex *depth = fbo->m_attach[ kAttDepthStencil ].m_tex;
++	if ( !depth )
++		depth = fbo->m_attach[ kAttDepth ].m_tex;
++	*ppFBO = fbo;
++	*ppDepthTex = depth;
++	return depth != NULL;
++}
++
++bool CGLMRayTraceHooks::GetBackbufferInfo( int *pWidth, int *pHeight, int *pMSAA )
++{
++	CGLMFBO *fbo; CGLMTex *depth;
++	if ( !GetDrawingFBO( &fbo, &depth ) )
++		return false;
++	*pWidth = depth->m_layout->m_key.m_xSize;
++	*pHeight = depth->m_layout->m_key.m_ySize;
++	*pMSAA = ( depth->m_layout->m_key.m_texFlags & kGLMTexMultisampled ) ? depth->m_layout->m_key.m_texSamples : 0;
++	return true;
++}
++
++GLuint CGLMRayTraceHooks::BuildProgram( const char *pVertex, const char *pFragment )
++{
++	GLuint vs = glCreateShader( GL_VERTEX_SHADER ), fs = glCreateShader( GL_FRAGMENT_SHADER );
++	glShaderSource( vs, 1, &pVertex, NULL ); glCompileShader( vs );
++	glShaderSource( fs, 1, &pFragment, NULL ); glCompileShader( fs );
++	GLint ok = 0;
++	glGetShaderiv( fs, GL_COMPILE_STATUS, &ok );
++	if ( !ok )
++	{
++		char log[2048]; glGetShaderInfoLog( fs, sizeof( log ), NULL, log );
++		Warning( "[rt] fragment shader failed: %s\n", log );
++		return 0;
++	}
++	GLuint prog = glCreateProgram();
++	glAttachShader( prog, vs ); glAttachShader( prog, fs ); glLinkProgram( prog );
++	glGetProgramiv( prog, GL_LINK_STATUS, &ok );
++	glDeleteShader( vs ); glDeleteShader( fs );
++	if ( !ok )
++	{
++		char log[2048]; glGetProgramInfoLog( prog, sizeof( log ), NULL, log );
++		Warning( "[rt] program link failed: %s\n", log );
++		return 0;
++	}
++	return prog;
++}
++
++GLuint CGLMRayTraceHooks::SurfaceTexture( IOSurfaceRef surface, GLuint *pCachedName, IOSurfaceRef *pCachedSurface, int *pCachedW, int *pCachedH )
++{
++	int w = (int)IOSurfaceGetWidth( surface ), h = (int)IOSurfaceGetHeight( surface );
++	if ( *pCachedName && *pCachedSurface == surface && *pCachedW == w && *pCachedH == h )
++		return *pCachedName;
++	if ( *pCachedName )
++		glDeleteTextures( 1, pCachedName );
++	GLuint tex = 0;
++	glGenTextures( 1, &tex );
++	glBindTexture( GL_TEXTURE_RECTANGLE_ARB, tex );
++	CGLError err = CGLTexImageIOSurface2D( CGLGetCurrentContext(), GL_TEXTURE_RECTANGLE_ARB, GL_RGBA8, w, h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, surface, 0 );
++	glTexParameteri( GL_TEXTURE_RECTANGLE_ARB, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
++	glTexParameteri( GL_TEXTURE_RECTANGLE_ARB, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
++	glBindTexture( GL_TEXTURE_RECTANGLE_ARB, 0 );
++	if ( err != kCGLNoError )
++	{
++		Warning( "[rt] CGLTexImageIOSurface2D failed (%d)\n", (int)err );
++		glDeleteTextures( 1, &tex );
++		return 0;
++	}
++	*pCachedName = tex; *pCachedSurface = surface; *pCachedW = w; *pCachedH = h;
++	return tex;
++}
++
++void CGLMRayTraceHooks::SaveState( SavedState &s )
++{
++	glPushAttrib( GL_ALL_ATTRIB_BITS );
++	glPushClientAttrib( GL_CLIENT_ALL_ATTRIB_BITS );
++	glGetIntegerv( GL_CURRENT_PROGRAM, &s.program );
++	glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING_EXT, &s.readFBO );
++	glGetIntegerv( GL_DRAW_FRAMEBUFFER_BINDING_EXT, &s.drawFBO );
++	glGetIntegerv( GL_ARRAY_BUFFER_BINDING_ARB, &s.arrayBuffer );
++	glGetIntegerv( GL_ACTIVE_TEXTURE, &s.activeTexture );
++}
++
++void CGLMRayTraceHooks::RestoreState( const SavedState &s )
++{
++	glBindFramebufferEXT( GL_READ_FRAMEBUFFER_EXT, s.readFBO );
++	glBindFramebufferEXT( GL_DRAW_FRAMEBUFFER_EXT, s.drawFBO );
++	glBindBufferARB( GL_ARRAY_BUFFER_ARB, s.arrayBuffer );
++	glUseProgram( s.program );
++	glActiveTexture( s.activeTexture );
++	glPopClientAttrib();
++	glPopAttrib();
++}
++
++void CGLMRayTraceHooks::DrawFullscreenQuad()
++{
++	glBegin( GL_TRIANGLE_STRIP );
++	glVertex2f( -1.0f, -1.0f ); glVertex2f( 1.0f, -1.0f ); glVertex2f( -1.0f, 1.0f ); glVertex2f( 1.0f, 1.0f );
++	glEnd();
++}
++
++bool CGLMRayTraceHooks::ResolveDepth( IOSurfaceRef depthSurface )
++{
++	if ( s_bFailed )
++		return false;
++	CGLMFBO *fbo; CGLMTex *depth;
++	if ( !GetDrawingFBO( &fbo, &depth ) )
++		return false;
++	int w = depth->m_layout->m_key.m_xSize, h = depth->m_layout->m_key.m_ySize;
++	bool bMSAA = ( depth->m_layout->m_key.m_texFlags & kGLMTexMultisampled ) != 0;
++
++	SavedState saved;
++	SaveState( saved );
++	while ( glGetError() != GL_NO_ERROR ) {}
++
++	if ( !s_packProgram )
++	{
++		s_packProgram = BuildProgram( s_pQuadVertexShader, s_pPackFragmentShader );
++		if ( !s_packProgram ) { s_bFailed = true; RestoreState( saved ); return false; }
++	}
++
++	// Source of the depth we sample: either the FBO's depth texture, or a single-sample resolve of its MSAA renderbuffer.
++	// Always go through our own single-sample depth texture: blitting works for the
++	// MSAA renderbuffer case, and togl's depth texture cannot be sampled directly.
++	GLuint depthTexName = depth->m_texName;
++	if ( bMSAA || true )
++	{
++		GLenum intFormat = depth->m_layout->m_format->m_glIntFormat;
++		if ( !s_depthResolveTex || s_depthResolveW != w || s_depthResolveH != h || s_depthResolveIntFormat != intFormat )
++		{
++			if ( s_depthResolveTex ) glDeleteTextures( 1, &s_depthResolveTex );
++			if ( s_depthResolveFBO ) glDeleteFramebuffersEXT( 1, &s_depthResolveFBO );
++			glGenTextures( 1, &s_depthResolveTex );
++			glBindTexture( GL_TEXTURE_2D, s_depthResolveTex );
++			glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
++			glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
++			glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE );
++			glTexImage2D( GL_TEXTURE_2D, 0, intFormat, w, h, 0, depth->m_layout->m_format->m_glDataFormat, depth->m_layout->m_format->m_glDataType, NULL );
++			glGenFramebuffersEXT( 1, &s_depthResolveFBO );
++			glBindFramebufferEXT( GL_FRAMEBUFFER_EXT, s_depthResolveFBO );	// both bind points, so draw/read buffer state applies
++			GLenum attach = ( intFormat == GL_DEPTH24_STENCIL8_EXT ) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT_EXT;
++			glFramebufferTexture2DEXT( GL_FRAMEBUFFER_EXT, attach, GL_TEXTURE_2D, s_depthResolveTex, 0 );
++			// depth-only framebuffer: no colour buffers, or it is incomplete
++			glDrawBuffer( GL_NONE );
++			glReadBuffer( GL_NONE );
++			s_depthResolveW = w; s_depthResolveH = h; s_depthResolveIntFormat = intFormat;
++		}
++		glBindFramebufferEXT( GL_READ_FRAMEBUFFER_EXT, fbo->m_name );
++		glBindFramebufferEXT( GL_DRAW_FRAMEBUFFER_EXT, s_depthResolveFBO );
++		glBlitFramebufferEXT( 0, 0, w, h, 0, 0, w, h, GL_DEPTH_BUFFER_BIT, GL_NEAREST );
++		depthTexName = s_depthResolveTex;
++	}
++
++	// Pack into the IOSurface texture.
++	GLuint packTex = SurfaceTexture( depthSurface, &s_depthPackTexName, &s_depthPackSurface, &s_depthPackW, &s_depthPackH );
++	if ( !packTex ) { s_bFailed = true; RestoreState( saved ); return false; }
++	if ( !s_depthPackFBO ) glGenFramebuffersEXT( 1, &s_depthPackFBO );
++	glBindFramebufferEXT( GL_FRAMEBUFFER_EXT, s_depthPackFBO );
++	glFramebufferTexture2DEXT( GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_RECTANGLE_ARB, packTex, 0 );
++	glViewport( 0, 0, s_depthPackW, s_depthPackH );
++	glDisable( GL_DEPTH_TEST ); glDisable( GL_BLEND ); glDisable( GL_SCISSOR_TEST ); glDisable( GL_STENCIL_TEST ); glDisable( GL_CULL_FACE ); glDisable( GL_ALPHA_TEST );
++	glColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
++	glUseProgram( s_packProgram );
++	glActiveTexture( GL_TEXTURE0 );
++	glBindTexture( GL_TEXTURE_2D, depthTexName );
++	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE );
++	glUniform1i( glGetUniformLocation( s_packProgram, "depthTex" ), 0 );
++	DrawFullscreenQuad();
++	glFinish();
++
++	GLenum err = glGetError();
++	RestoreState( saved );
++	if ( err != GL_NO_ERROR )
++	{
++		Warning( "[rt] GL error 0x%x in depth resolve; ray tracing disabled\n", err );
++		s_bFailed = true;
++		return false;
++	}
++	return true;
++}
++
++bool CGLMRayTraceHooks::Composite( IOSurfaceRef resultSurface, int nResultWidth, int nResultHeight, bool bReplace )
++{
++	if ( s_bFailed )
++		return false;
++	CGLMFBO *fbo; CGLMTex *depth;
++	if ( !GetDrawingFBO( &fbo, &depth ) )
++		return false;
++	int w = depth->m_layout->m_key.m_xSize, h = depth->m_layout->m_key.m_ySize;
++
++	SavedState saved;
++	SaveState( saved );
++	while ( glGetError() != GL_NO_ERROR ) {}
++
++	if ( !s_compositeProgram )
++	{
++		s_compositeProgram = BuildProgram( s_pQuadVertexShader, s_pCompositeFragmentShader );
++		if ( !s_compositeProgram ) { s_bFailed = true; RestoreState( saved ); return false; }
++	}
++	GLuint resultTex = SurfaceTexture( resultSurface, &s_resultTexName, &s_resultSurface, &s_resultW, &s_resultH );
++	if ( !resultTex ) { s_bFailed = true; RestoreState( saved ); return false; }
++
++	glBindFramebufferEXT( GL_FRAMEBUFFER_EXT, fbo->m_name );
++	glViewport( 0, 0, w, h );
++	glDisable( GL_DEPTH_TEST ); glDisable( GL_SCISSOR_TEST ); glDisable( GL_STENCIL_TEST ); glDisable( GL_CULL_FACE ); glDisable( GL_ALPHA_TEST );
++	glColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE );
++	if ( bReplace )
++		glDisable( GL_BLEND );				// debug views replace the image
++	else
++	{
++		glEnable( GL_BLEND );
++		glBlendFunc( GL_DST_COLOR, GL_ZERO );	// multiply
++	}
++	glUseProgram( s_compositeProgram );
++	glActiveTexture( GL_TEXTURE0 );
++	glBindTexture( GL_TEXTURE_RECTANGLE_ARB, resultTex );
++	glTexParameteri( GL_TEXTURE_RECTANGLE_ARB, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
++	glTexParameteri( GL_TEXTURE_RECTANGLE_ARB, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
++	glUniform1i( glGetUniformLocation( s_compositeProgram, "resultTex" ), 0 );
++	glUniform2f( glGetUniformLocation( s_compositeProgram, "resultSize" ), (float)nResultWidth, (float)nResultHeight );
++	DrawFullscreenQuad();
++
++	GLenum err = glGetError();
++	RestoreState( saved );
++	if ( err != GL_NO_ERROR )
++	{
++		Warning( "[rt] GL error 0x%x in composite; ray tracing disabled\n", err );
++		s_bFailed = true;
++		return false;
++	}
++	return true;
++}
++
++extern "C" __attribute__((visibility("default"))) bool GLMRT_GetBackbufferInfo( int *pWidth, int *pHeight, int *pMSAA )
++{
++	return CGLMRayTraceHooks::GetBackbufferInfo( pWidth, pHeight, pMSAA );
++}
++extern "C" __attribute__((visibility("default"))) bool GLMRT_ResolveDepth( void *depthSurface )
++{
++	return CGLMRayTraceHooks::ResolveDepth( (IOSurfaceRef)depthSurface );
++}
++extern "C" __attribute__((visibility("default"))) bool GLMRT_Composite( void *resultSurface, int nResultWidth, int nResultHeight, int bReplace )
++{
++	return CGLMRayTraceHooks::Composite( (IOSurfaceRef)resultSurface, nResultWidth, nResultHeight, bReplace != 0 );
++}
++#endif // OSX
+diff --git a/togl/wscript b/togl/wscript
+index 9d55d56..e614c30 100755
+--- a/togl/wscript
++++ b/togl/wscript
+@@ -33,6 +33,7 @@ def build(bld):
+ 	if bld.env.DEST_OS == "darwin":
+ 		source += [
+ 			'linuxwin/glmgrcocoa.mm',
++			'linuxwin/glmrt.cpp',
+ 		]
+ 
+ 	includes = [
+@@ -47,7 +48,7 @@ def build(bld):
+ 	libs = ['tier0','tier1','tier2','vstdlib','mathlib']
+ 
+ 	if bld.env.DEST_OS == "darwin":
+-		libs += ["OPENGL", "CARBON"]
++		libs += ["OPENGL", "CARBON", "IOSURFACE"]
+ 
+ 	install_path = bld.env.LIBDIR
+ 
+diff --git a/wscript b/wscript
+index 16f2263..824b4da 100644
+--- a/wscript
++++ b/wscript
+@@ -94,6 +94,7 @@ projects={
+ 		'utils/vtex',
+ 		'unicode',
+ 		'video',
++		'rtmetal',
+ 	],
+ 	'tests': [
+ 		'appframework',
+@@ -373,6 +374,9 @@ def check_deps(conf):
+ 		conf.env.FRAMEWORK_COREFOUNDATION = "CoreFoundation"
+ 		conf.env.FRAMEWORK_COREGRAPHICS = "CoreGraphics"
+ 		conf.env.FRAMEWORK_OPENGL = "OpenGL"
++		conf.env.FRAMEWORK_IOSURFACE = "IOSurface"
++		conf.env.FRAMEWORK_METAL = "Metal"
++		conf.env.FRAMEWORK_QUARTZCORE = "QuartzCore"
+ 		conf.env.FRAMEWORK_CARBON = "Carbon"
+ 		conf.env.FRAMEWORK_APPLICATIONSERVICES = "ApplicationServices"
+ 		conf.env.FRAMEWORK_CORESERVICES = "CoreServices"
+-- 
+2.55.0
+
