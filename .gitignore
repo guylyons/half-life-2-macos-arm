@@ -2,3 +2,12 @@ source-engine/
 stage/
 Half-Life 2.app/
 *.log
+*.png
+*.jpg
+/click
+/move
+/click.swift
+/move.swift
+/spike/rt_bench
+/spike/interop_bench
+/*.txt
