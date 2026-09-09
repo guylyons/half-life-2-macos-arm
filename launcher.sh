@@ -6,7 +6,7 @@
 #   --dry-run      set up the mod directory and print the command instead of running it
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-RES="$HERE/../Resources"
+RES="$(cd "$HERE/../Resources" && pwd)"
 STEAM="${HL2_STEAM_DIR:-$HOME/Library/Application Support/Steam/steamapps/common/Half-Life 2}"
 BASE="${HL2_BASE:-$HOME/Library/Application Support/Half-Life-2-arm64}"
 DRY=0
@@ -26,9 +26,10 @@ Install Half-Life 2 in Steam (beta branch steam_legacy), or set HL2_STEAM_DIR."
 In Steam: Half-Life 2 > Properties > Betas > steam_legacy (Pre-25th Anniversary Build)."
 
 MOD="$BASE/hl2"
-mkdir -p "$MOD/bin" "$MOD/cfg" "$MOD/save" "$MOD/custom"
-cp -f "$RES/hl2/bin/"*.dylib "$MOD/bin/"
-sed "s|@STEAM_HL2@|$STEAM|g" "$RES/gameinfo.hl2.txt" > "$MOD/gameinfo.txt"
+mkdir -p "$MOD/cfg" "$MOD/save" "$MOD/custom"
+# The game libraries stay inside the app (their library search path is relative
+# to the bundle); gameinfo.txt points the engine at them by absolute path.
+sed -e "s|@STEAM_HL2@|$STEAM|g" -e "s|@APP_GAMEBIN@|$RES/hl2/bin|g" "$RES/gameinfo.hl2.txt" > "$MOD/gameinfo.txt"
 
 cd "$HERE"
 if [ "$DRY" = 1 ]; then

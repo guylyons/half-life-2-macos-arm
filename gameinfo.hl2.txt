@@ -27,7 +27,7 @@
 
 			mod+mod_write+default_write_path	|gameinfo_path|.
 			game+game_write		|gameinfo_path|.
-			gamebin			|gameinfo_path|bin
+			gamebin			"@APP_GAMEBIN@"
 
 			game			"@STEAM_HL2@/hl2"
 			platform		"@STEAM_HL2@/platform"
