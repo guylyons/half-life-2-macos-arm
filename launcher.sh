@@ -31,6 +31,17 @@ mkdir -p "$MOD/cfg" "$MOD/save" "$MOD/custom"
 # to the bundle); gameinfo.txt points the engine at them by absolute path.
 sed -e "s|@STEAM_HL2@|$STEAM|g" -e "s|@APP_GAMEBIN@|$RES/hl2/bin|g" "$RES/gameinfo.hl2.txt" > "$MOD/gameinfo.txt"
 
+# First run: start with maximum video settings at the main display's native
+# resolution (pixels). The engine rewrites this file whenever settings change.
+if [ ! -f "$MOD/videoconfig_mac.cfg" ] && [ -f "$RES/videoconfig.template.cfg" ]; then
+  NATIVE="$(system_profiler SPDisplaysDataType 2>/dev/null | awk '
+    /Resolution:/ { res=$2" "$4 }
+    /Main Display: Yes/ { print res; exit }')"
+  W="${NATIVE%% *}"; H="${NATIVE##* }"
+  case "$W$H" in *[!0-9]*|"") W=1920; H=1080;; esac
+  sed -e "s|@WIDTH@|$W|" -e "s|@HEIGHT@|$H|" "$RES/videoconfig.template.cfg" > "$MOD/videoconfig_mac.cfg"
+fi
+
 cd "$HERE"
 if [ "$DRY" = 1 ]; then
   echo "exec \"$HERE/hl2_launcher\" -game \"$MOD\" $*"
