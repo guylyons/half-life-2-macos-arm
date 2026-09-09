@@ -1,0 +1,173 @@
+From 59df1aea9dad5b14e7cbcf2c963cb4d05810bec5 Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Wed, 9 Sep 2026 15:09:58 -0400
+Subject: [PATCH 3/3] macos-arm64: Retina support
+
+Create the SDL window high-DPI aware, blit to the real drawable size,
+report the native display size in pixels, and list pixel-sized display
+modes so the true native resolution (e.g. 3024x1964) can be selected in
+fullscreen. The engine renders offscreen and blits to the desktop-sized
+window, so a mode here is a render size, not a display mode switch.
+---
+ appframework/glmrendererinfo_osx.mm | 37 +++++++++++++++++++++++++++++
+ appframework/sdlmgr.cpp             | 32 ++++++++++++++++++++++---
+ engine/sys_mainwind.cpp             | 17 +++++++++++++
+ 3 files changed, 83 insertions(+), 3 deletions(-)
+
+diff --git a/appframework/glmrendererinfo_osx.mm b/appframework/glmrendererinfo_osx.mm
+index a36f624..c622240 100644
+--- a/appframework/glmrendererinfo_osx.mm
++++ b/appframework/glmrendererinfo_osx.mm
+@@ -1507,6 +1507,20 @@ void	GLMDisplayInfo::PopulateModes( void )
+ 	CFNumberRef		number;
+ 	CFBooleanRef	boolean;
+ 	
++	// pixels per point of this display's current mode (2.0 on Retina displays)
++	float flPixelScale = 1.0f;
++	{
++		CGDisplayModeRef curMode = CGDisplayCopyDisplayMode( m_info.m_cgDisplayID );
++		if ( curMode )
++		{
++			size_t ptW = CGDisplayModeGetWidth( curMode );
++			size_t pxW = CGDisplayModeGetPixelWidth( curMode );
++			if ( ptW > 0 && pxW > ptW )
++				flPixelScale = (float)pxW / (float)ptW;
++			CGDisplayModeRelease( curMode );
++		}
++	}
++
+ 	modeList = CGDisplayAvailableModes( m_info.m_cgDisplayID );
+ 	if ( modeList != NULL )
+ 	{
+@@ -1559,6 +1573,29 @@ void	GLMDisplayInfo::PopulateModes( void )
+ 				{
+ 					GLMDisplayMode *newmode = new GLMDisplayMode( modeWidth, modeHeight, refreshrate );
+ 					m_modes->AddToTail( newmode );
++
++					// HiDPI: CGDisplayAvailableModes lists sizes in points. Also offer the
++					// pixel size, so the true native resolution can be selected; the
++					// engine renders offscreen and blits to the desktop-sized window,
++					// so any size here is a render size, not a real display mode switch.
++					if ( flPixelScale > 1.01f )
++					{
++						long pixWidth = (long)( modeWidth * flPixelScale + 0.5f );
++						long pixHeight = (long)( modeHeight * flPixelScale + 0.5f );
++						bool bDuplicate = false;
++						FOR_EACH_VEC( (*m_modes), k )
++						{
++							if ( (*m_modes)[k]->m_info.m_modePixelWidth == (uint)pixWidth && (*m_modes)[k]->m_info.m_modePixelHeight == (uint)pixHeight )
++							{
++								bDuplicate = true;
++								break;
++							}
++						}
++						if ( !bDuplicate )
++						{
++							m_modes->AddToTail( new GLMDisplayMode( pixWidth, pixHeight, refreshrate ) );
++						}
++					}
+ 				}
+ 			}
+ 		}
+diff --git a/appframework/sdlmgr.cpp b/appframework/sdlmgr.cpp
+index e1a542c..8b0b544 100644
+--- a/appframework/sdlmgr.cpp
++++ b/appframework/sdlmgr.cpp
+@@ -290,7 +290,8 @@ public:
+ 	
+ 	virtual void GetMouseDelta( int &x, int &y, bool bIgnoreNextMouseDelta = false );
+ 
+-	virtual void GetNativeDisplayInfo( int nDisplay, uint &nWidth, uint &nHeight, uint &nRefreshHz ); // Retrieve the size of the monitor (desktop)
++	virtual void GetNativeDisplayInfo( int nDisplay, uint &nWidth, uint &nHeight, uint &nRefreshHz );
++	float GetDisplayScale(); // pixels per point of the display the window is on
+ 	virtual void RenderedSize( uint &width, uint &height, bool set );	// either set or retrieve rendered size value (from dxabstract)
+ 	virtual void DisplayedSize( uint &width, uint &height );			// query backbuffer size (window size whether FS or windowed)
+ 
+@@ -835,6 +836,11 @@ bool CSDLMgr::CreateHiddenGameWindow( const char *pTitle, int width, int height
+ 	int x = SDL_WINDOWPOS_CENTERED;
+ 	int y = SDL_WINDOWPOS_CENTERED;
+ 	int flags = SDL_WINDOW_HIDDEN;
++#ifdef OSX
++	// Retina: the GL drawable is in pixels (2x points on HiDPI displays) so the
++	// game can render at the display's true native resolution in fullscreen.
++	flags |= SDL_WINDOW_ALLOW_HIGHDPI;
++#endif
+ #if defined( DX_TO_GL_ABSTRACTION )
+ 	flags |= SDL_WINDOW_OPENGL;
+ #endif
+@@ -1325,7 +1331,8 @@ void CSDLMgr::ShowPixels( CShowPixelsParams *params )
+ 			int dstxmax = 0;
+ 			int dstymax = 0;
+ 
+-			SDL_GetWindowSize(m_Window, &dstxmax, &dstymax);
++			// The blit target is the GL drawable, which on HiDPI displays is larger than the window in points.
++			SDL_GL_GetDrawableSize(m_Window, &dstxmax, &dstymax);
+ 
+ 			if (gl_blit_halfx.GetInt())
+ 			{
+@@ -2144,6 +2151,25 @@ void CSDLMgr::GetNativeDisplayInfo( int nDisplay, uint &nWidth, uint &nHeight, u
+ 	nRefreshHz = mode.refresh_rate;
+ 	nWidth = mode.w;
+ 	nHeight = mode.h;
++
++	// SDL reports desktop modes in points; report the native size in pixels so
++	// the HiDPI resolution is offered and labelled "(native)".
++	float flScale = GetDisplayScale();
++	nWidth = (uint)( nWidth * flScale + 0.5f );
++	nHeight = (uint)( nHeight * flScale + 0.5f );
++}
++
++// Pixels per point of the display the window is on (2.0 on Retina displays, 1.0 otherwise).
++float CSDLMgr::GetDisplayScale()
++{
++	if ( !m_Window )
++		return 1.0f;
++	int ww = 0, wh = 0, dw = 0, dh = 0;
++	SDL_GetWindowSize( m_Window, &ww, &wh );
++	SDL_GL_GetDrawableSize( m_Window, &dw, &dh );
++	if ( ww <= 0 || dw <= 0 )
++		return 1.0f;
++	return (float)dw / (float)ww;
+ }
+ 
+ 
+@@ -2168,7 +2194,7 @@ void CSDLMgr::DisplayedSize( uint &width, uint &height )
+ 	SDLAPP_FUNC;
+ 
+ 	int w, h;
+-	SDL_GetWindowSize(m_Window, &w, &h);
++	SDL_GL_GetDrawableSize(m_Window, &w, &h);
+ 	width = (uint) w;
+ 	height = (uint) h;
+ }
+diff --git a/engine/sys_mainwind.cpp b/engine/sys_mainwind.cpp
+index aecf5eb..6807392 100644
+--- a/engine/sys_mainwind.cpp
++++ b/engine/sys_mainwind.cpp
+@@ -1613,6 +1613,23 @@ void CGame::GetDesktopInfo( int &width, int &height, int &refreshrate )
+ 			}
+ 		}
+ 	}
++
++#ifdef OSX
++	// SDL display bounds are in points; the game's video modes are in pixels
++	// (HiDPI window), so scale to pixels or the native mode gets filtered out.
++	if ( g_pLauncherMgr && g_pLauncherMgr->GetWindowRef() )
++	{
++		SDL_Window *pWindow = (SDL_Window *)g_pLauncherMgr->GetWindowRef();
++		int ww = 0, wh = 0, dw = 0, dh = 0;
++		SDL_GetWindowSize( pWindow, &ww, &wh );
++		SDL_GL_GetDrawableSize( pWindow, &dw, &dh );
++		if ( ww > 0 && dw > ww )
++		{
++			width = (int)( (float)width * dw / ww + 0.5f );
++			height = (int)( (float)height * dw / ww + 0.5f );
++		}
++	}
++#endif
+ #else
+ 	// order of initialization means that this might get called early.  In that case go ahead and grab the current
+ 	// screen window and setup based on that.
+-- 
+2.55.0
+
