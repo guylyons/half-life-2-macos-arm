@@ -1,7 +1,7 @@
 From efecf594f00747463458ed633968ff865ba83372 Mon Sep 17 00:00:00 2001
 From: Guy Lyons <guylyons2@gmail.com>
 Date: Wed, 9 Sep 2026 15:04:58 -0400
-Subject: [PATCH 2/3] macos-arm64: do not use fullscreen Spaces (window was
+Subject: [PATCH 2/4] macos-arm64: do not use fullscreen Spaces (window was
  screen minus menu bar, offsetting mouse and clipping)
 
 ---
