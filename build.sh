@@ -12,7 +12,7 @@ PYTHON="$BREW/bin/python3"
 export PKG_CONFIG_PATH="$BREW/opt/zlib/lib/pkgconfig:$BREW/opt/bzip2/lib/pkgconfig:$BREW/opt/curl/lib/pkgconfig:$BREW/opt/jpeg-turbo/lib/pkgconfig:$BREW/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
 deps() {
-  for p in sdl2-compat freetype fontconfig jpeg-turbo libpng curl zlib bzip2 opus pkg-config; do
+  for p in sdl2-compat freetype fontconfig jpeg-turbo libpng curl zlib bzip2 pkg-config; do
     brew list --versions "$p" >/dev/null 2>&1 || brew install "$p"
   done
   xcode-select -p >/dev/null
@@ -20,17 +20,23 @@ deps() {
 
 patch() {
   [ -d "$ENGINE/.git" ] || git clone --recursive --depth 1 https://github.com/nillerusr/source-engine.git "$ENGINE"
-  cd "$ENGINE"
-  if ! git rev-parse --verify -q macos-arm64 >/dev/null; then
-    git checkout -q -b macos-arm64
-    if ls "$ROOT"/patches/*.patch >/dev/null 2>&1; then git am "$ROOT"/patches/*.patch; fi
-  fi
-  git checkout -q macos-arm64
+  # Fixes live on branch macos-arm64 in the engine tree and in the ivp submodule;
+  # patches/engine and patches/ivp recreate those branches on a fresh clone.
+  apply_patches() {  # $1 = repo dir, $2 = patch dir
+    cd "$1"
+    if ! git rev-parse --verify -q macos-arm64 >/dev/null; then
+      git checkout -q -b macos-arm64
+      if ls "$2"/*.patch >/dev/null 2>&1; then git am -q "$2"/*.patch; fi
+    fi
+    git checkout -q macos-arm64
+  }
+  apply_patches "$ENGINE/ivp" "$ROOT/patches/ivp"
+  apply_patches "$ENGINE" "$ROOT/patches/engine"
 }
 
 configure() {
   cd "$ENGINE"
-  "$PYTHON" waf configure -T release --prefix="$STAGE" --build-games=hl2 --enable-opus
+  "$PYTHON" waf configure -T release --prefix="$STAGE" --build-games=hl2
 }
 
 build() { cd "$ENGINE" && "$PYTHON" waf build -j"$JOBS"; }

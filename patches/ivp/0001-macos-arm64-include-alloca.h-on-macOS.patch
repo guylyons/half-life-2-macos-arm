@@ -1,0 +1,24 @@
+From 52d9e6d8a0745e3de18398b48f3f9eb1a52d1da3 Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Wed, 9 Sep 2026 14:03:07 -0400
+Subject: [PATCH] macos-arm64: include alloca.h on macOS
+
+---
+ ivp_utility/ivu_types.hxx | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/ivp_utility/ivu_types.hxx b/ivp_utility/ivu_types.hxx
+index b63c2ef..a559ee0 100644
+--- a/ivp_utility/ivu_types.hxx
++++ b/ivp_utility/ivu_types.hxx
+@@ -231,6 +231,7 @@ enum IVP_RETURN_TYPE {
+ #if !defined(__MWERKS__) || !defined(__POWERPC__)
+ #   ifdef OSX
+ #       include <malloc/malloc.h>
++#       include <alloca.h>   /* macOS: alloca() is not declared by malloc/malloc.h */
+ #   else
+ #       include <malloc.h>
+ #   endif
+-- 
+2.55.0
+
