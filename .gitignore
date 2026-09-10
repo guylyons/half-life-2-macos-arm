@@ -14,3 +14,4 @@ testbase/
 stage-episodic/
 *.app/
 !/gameinfo.*.txt
+sweep/

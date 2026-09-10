@@ -131,6 +131,25 @@ What was built differs from the phase-1 plan above in these ways:
   ~5 ms GPU per traced frame, 176 fps; 62 fps with full-resolution tracing.
   A bounded GPU wait disables the layer on a hang or fault instead of freezing
   the game.
-- **Not done:** reflections; alpha-tested geometry (fences, foliage) is absent
-  from the BVH rather than texture-tested; the engine's projected NPC shadows
-  still draw alongside the traced ones.
+- **Reflections.** Surfaces whose material has an environment map reflect
+  (water keeps the engine's mirrored render). Per-triangle material tables
+  carry reflectivity (`$envmaptint` times the mask average, read from the
+  texture's smallest mip), tint and a flat colour (lightmap average times the
+  texture's reflectivity). A short probe identifies each pixel's triangle; one
+  glossy reflected ray per pixel on an alternating checkerboard takes its
+  colour from the captured frame when the hit is on screen, else the flat
+  colour; a second additive composite pass blends it in with a view-dependent
+  falloff. `rt_reflections`, `rt_reflection_strength`, `rt_list_reflective`.
+- **Cost control.** AO directions are shared across 2x2 pixel blocks; a budget
+  controller (`rt_budget`, 7 ms) first drops to one AO ray per pixel, then
+  drops reflections, while the smoothed tracer GPU time is over budget.
+- **Frame hooks** are queued render-thread function calls, not screen quads
+  (the engine's save-thumbnail path flushes the material queue on the main
+  thread, where dynamic vertex buffers take a system-memory path that broke
+  the quad; saving crashed).
+- **Verification.** `scripts/rtsweep.py` loaded every campaign map of HL2 and
+  both episodes with the layer on; all load and trace. Not done by hand: a
+  full playthrough, and 2560x1440 fullscreen on the external display.
+- **Not done:** alpha-tested geometry (fences, foliage) is absent from the BVH
+  rather than texture-tested; the engine's projected NPC shadows still draw
+  alongside the traced ones; reflections of off-screen areas are flat colours.
