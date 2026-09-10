@@ -1,7 +1,7 @@
 From f31f91a412d95407c0ef20bc547462e8ba0d6122 Mon Sep 17 00:00:00 2001
 From: Guy Lyons <guylyons2@gmail.com>
 Date: Thu, 10 Sep 2026 03:09:28 -0400
-Subject: [PATCH 13/14] macos-arm64: ray-traced reflections
+Subject: [PATCH 13/15] macos-arm64: ray-traced reflections
 
 Surfaces whose material has an environment map reflect; water keeps the
 engine's own mirrored render. Per-triangle material tables (reflectivity,

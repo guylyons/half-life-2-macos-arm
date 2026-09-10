@@ -1,0 +1,172 @@
+From ac0bec0dbc142339498c202cedee3cf03ffd91ca Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Thu, 10 Sep 2026 08:57:18 -0400
+Subject: [PATCH 15/15] macos-arm64: reflections only on glossy surfaces;
+ reflection history clipping; rt_shadows 2
+
+Source puts an environment map on nearly every lightmapped material as a
+cheap specular term; tracing a real reflection onto concrete and plaster
+read as a milky haze over the whole scene. Reflections are now limited to
+glossy surface properties (metal, glass, tile, ...) with per-property
+roughness. The reflection history is clipped against the current frame's
+neighbourhood so a reflected object that moved does not trail. rt_shadows 2
+darkens with shadows from all geometry, sharpening the baked shadows'
+edges (costly: about double the trace).
+---
+ game/client/rt_layer.cpp | 49 ++++++++++++++++++++++++++++++++--------
+ rtmetal/rtmetal.mm       | 21 ++++++++++++++---
+ 2 files changed, 58 insertions(+), 12 deletions(-)
+
+diff --git a/game/client/rt_layer.cpp b/game/client/rt_layer.cpp
+index e9f6ad1..0d0cb25 100644
+--- a/game/client/rt_layer.cpp
++++ b/game/client/rt_layer.cpp
+@@ -38,7 +38,7 @@
+ 
+ static ConVar rt_enable( "rt_enable", "1", FCVAR_ARCHIVE, "Ray-traced lighting layer (ambient occlusion and sun shadows)." );
+ static ConVar rt_ao( "rt_ao", "1", FCVAR_ARCHIVE, "Ray-traced ambient occlusion." );
+-static ConVar rt_shadows( "rt_shadows", "1", FCVAR_ARCHIVE, "Ray-traced sun shadows from dynamic objects (NPCs, physics props, doors) onto sunlit surfaces." );
++static ConVar rt_shadows( "rt_shadows", "1", FCVAR_ARCHIVE, "Ray-traced sun shadows: 1 from dynamic objects only (NPCs, physics props, doors); 2 from everything, which sharpens the baked shadows' blurred edges." );
+ static ConVar rt_ao_radius( "rt_ao_radius", "64", FCVAR_ARCHIVE, "AO ray length in world units." );
+ static ConVar rt_ao_strength( "rt_ao_strength", "0.8", FCVAR_ARCHIVE, "AO darkening, 0..1." );
+ static ConVar rt_shadow_strength( "rt_shadow_strength", "0.7", FCVAR_ARCHIVE, "Sun shadow darkening, 0..1." );
+@@ -47,7 +47,7 @@ static ConVar rt_divisor( "rt_divisor", "0", FCVAR_ARCHIVE, "Trace resolution di
+ static ConVar rt_ao_rays( "rt_ao_rays", "2", FCVAR_ARCHIVE, "AO rays per pixel per frame." );
+ static ConVar rt_reflections( "rt_reflections", "1", FCVAR_ARCHIVE, "Ray-traced reflections on surfaces with an environment map (metal, tiles, glass). Water keeps the engine's own reflections." );
+ static ConVar rt_reflection_strength( "rt_reflection_strength", "0.7", FCVAR_ARCHIVE, "Scales material reflectivity for ray-traced reflections, 0..1." );
+-static ConVar rt_reflection_roughness( "rt_reflection_roughness", "0.15", FCVAR_ARCHIVE, "Assumed roughness of environment-mapped surfaces, 0..1 (blurs the reflection)." );
++static ConVar rt_reflection_roughness( "rt_reflection_roughness", "0.15", FCVAR_ARCHIVE, "Roughness for glossy surfaces without a known surface property, 0..1 (blurs the reflection)." );
+ static ConVar rt_sky_color( "rt_sky_color", "0.35 0.38 0.45", FCVAR_ARCHIVE, "Colour of reflected rays that leave the level, 0..1." );
+ static ConVar rt_static_props( "rt_static_props", "1", FCVAR_ARCHIVE, "Include static props in the ray-traced geometry (takes effect on map load)." );
+ static ConVar rt_dynamic( "rt_dynamic", "2", FCVAR_ARCHIVE, "Dynamic objects in the ray-traced geometry: 0 none, 1 rigid only (physics props, doors, brush entities), 2 also skinned (NPCs, ragdolls)." );
+@@ -170,7 +170,32 @@ static bool VarIsSet( IMaterial *pMat, const char *pVarName )
+ 	return bFound && pVar && pVar->IsDefined();
+ }
+ 
+-static bool ClassifyReflective( IMaterial *pMat, float *pflReflectivity, float *pTint )
++// Which surfaces get mirror-like reflections. Source puts an environment map on nearly every
++// lightmapped material (concrete, plaster, stone) as a cheap specular highlight; tracing a real
++// reflection onto those reads as a milky haze. Only surfaces that are glossy in the physical
++// sense reflect: by surface property, or by name for materials that do not declare one.
++static bool IsGlossySurface( IMaterial *pMat, float *pflRoughness )
++{
++	*pflRoughness = 0.15f;
++	bool bFound = false;
++	IMaterialVar *pProp = pMat->FindVar( "$surfaceprop", &bFound, false );
++	const char *pS = ( bFound && pProp && pProp->IsDefined() ) ? pProp->GetStringValue() : "";
++	const char *pName = pMat->GetName();
++	struct { const char *pProp; float flRough; } glossy[] = {
++		{ "metal", 0.12f }, { "metalpanel", 0.12f }, { "metalvehicle", 0.1f }, { "metalvent", 0.15f }, { "combine_metal", 0.1f }, { "metal_box", 0.15f }, { "solidmetal", 0.12f },
++		{ "glass", 0.04f }, { "glassbottle", 0.04f }, { "combine_glass", 0.04f }, { "computer", 0.1f }, { "tile", 0.15f }, { "porcelain", 0.1f }, { "slime", 0.05f }, { "ice", 0.05f },
++		{ "chainlink", 0.2f } };
++	for ( auto &g : glossy )
++		if ( !V_stricmp( pS, g.pProp ) ) { *pflRoughness = g.flRough; return true; }
++	if ( pS[0] && V_stricmp( pS, "default" ) )
++		return false;	// declared and not glossy (concrete, plaster, wood, dirt, ...)
++	const char *names[] = { "glass", "window", "metal", "tile", "chrome", "mirror", "combine", "monitor", "screen" };
++	for ( auto n : names )
++		if ( V_stristr( pName, n ) ) { *pflRoughness = V_stristr( pName, "glass" ) || V_stristr( pName, "window" ) ? 0.04f : 0.15f; return true; }
++	return false;
++}
++
++static bool ClassifyReflective( IMaterial *pMat, float *pflReflectivity, float *pTint, float *pflRoughness = NULL )
+ {
+ 	pTint[0] = pTint[1] = pTint[2] = 1.0f;
+ 	*pflReflectivity = 0.0f;
+@@ -180,6 +205,10 @@ static bool ClassifyReflective( IMaterial *pMat, float *pflReflectivity, float *
+ 	pMat->FindVar( "$reflecttexture", &bFound, false );
+ 	if ( bFound )
+ 		return false;		// water
++	float flRough = 0.15f;
++	if ( !IsGlossySurface( pMat, &flRough ) )
++		return false;
++	if ( pflRoughness ) *pflRoughness = flRough;
+ 	IMaterialVar *pEnv = pMat->FindVar( "$envmap", &bFound, false );
+ 	if ( !bFound || !pEnv || !pEnv->IsDefined() )
+ 		return false;
+@@ -317,9 +346,10 @@ static bool ExtractBspModel( const byte *pBase, int nModel, CUtlVector<float> &v
+ 					if ( n > 0 ) vLight = sum / ( 255.0f * n );
+ 				}
+ 			}
+-			ClassifyReflective( pFaceMat, &r, tint );
++			float rough = rt_reflection_roughness.GetFloat();
++			ClassifyReflective( pFaceMat, &r, tint, &rough );
+ 			MaterialFlatColor( pFaceMat, vLight, flat );
+-			RT_PackMaterial( packed, r, rt_reflection_roughness.GetFloat(), tint, flat );
++			RT_PackMaterial( packed, r, rough, tint, flat );
+ 		}
+ 
+ 		// gather the face polygon
+@@ -493,10 +523,10 @@ static const RTModelTris_t *GetModelTriangles( const model_t *pModel, int nSkin,
+ 			continue;
+ 		unsigned int packed[2] = { 0, 0 };
+ 		{
+-			float r = 0.0f, tint[3] = { 1, 1, 1 }, flat[3];
+-			ClassifyReflective( batch.m_pMaterial, &r, tint );
++			float r = 0.0f, tint[3] = { 1, 1, 1 }, flat[3], rough = rt_reflection_roughness.GetFloat();
++			ClassifyReflective( batch.m_pMaterial, &r, tint, &rough );
+ 			MaterialFlatColor( batch.m_pMaterial, Vector( 0.45f, 0.45f, 0.45f ), flat );
+-			RT_PackMaterial( packed, r, rt_reflection_roughness.GetFloat(), tint, flat );
++			RT_PackMaterial( packed, r, rough, tint, flat );
+ 		}
+ 		unsigned int base = pTris->verts.Count();
+ 		for ( int v = 0; v < batch.m_Verts.Count(); v++ )
+@@ -980,7 +1010,8 @@ CON_COMMAND( rt_list_reflective, "List the world materials of this map that the
+ 				bool ok = VTFAverage( pMaskName, rgba );
+ 				V_snprintf( maskInfo, sizeof( maskInfo ), " mask=%s avg=%s%.2f", pMaskName, ok ? "" : "FAILED ", ( rgba[0] + rgba[1] + rgba[2] ) / 3.0f );
+ 			}
+-			Msg( "[rt] %-50s r %.2f tint %.2f %.2f %.2f%s%s%s (%s)\n", pName, r, tint[0], tint[1], tint[2], maskInfo, bAlpha ? " basealpha" : "", bNAlpha ? " normalalpha" : "", pM->GetShaderName() );
++			bool bP = false; IMaterialVar *pP = pM->FindVar( "$surfaceprop", &bP, false );
++			Msg( "[rt] %-50s r %.2f tint %.2f %.2f %.2f%s%s%s (%s, %s)\n", pName, r, tint[0], tint[1], tint[2], maskInfo, bAlpha ? " basealpha" : "", bNAlpha ? " normalalpha" : "", pM->GetShaderName(), bP && pP ? pP->GetStringValue() : "-" );
+ 		}
+ 	}
+ }
+diff --git a/rtmetal/rtmetal.mm b/rtmetal/rtmetal.mm
+index 0cb48c3..53cdbec 100644
+--- a/rtmetal/rtmetal.mm
++++ b/rtmetal/rtmetal.mm
+@@ -195,8 +195,8 @@ kernel void trace(constant Params& p [[buffer(0)]],
+     if (p.shadowEnabled && p.hasSun) {
+         float3 sunDir = float3(p.sunDir);
+         float ndl = dot(N, sunDir);
+-        bool bNearDynamic = false;
+-        if (ndl > 0.0) {
++        bool bNearDynamic = p.shadowEnabled >= 2;
++        if (ndl > 0.0 && !bNearDynamic) {
+             for (int i = 0; i < p.numShadowBoxes; i++) {
+                 float3 bmin = float3(shadowBoxes[i*6], shadowBoxes[i*6+1], shadowBoxes[i*6+2]);
+                 float3 bmax = float3(shadowBoxes[i*6+3], shadowBoxes[i*6+4], shadowBoxes[i*6+5]);
+@@ -229,7 +229,9 @@ kernel void trace(constant Params& p [[buffer(0)]],
+                     probe[0] = origin.x; probe[1] = origin.y; probe[2] = origin.z; probe[3] = dir.x; probe[4] = dir.y; probe[5] = dir.z;
+                     probe[6] = res.distance; probe[7] = float(res.instance_id); probe[8] = float(res.primitive_id); probe[9] = N.x; probe[10] = N.y; probe[11] = N.z; }
+             }
+-            if (bDynamic && !bWorld) sun = 0.0;
++            // shadowEnabled 1: only dynamic objects darken (the lightmaps hold the static shadows);
++            // 2: everything darkens, which sharpens the lightmaps' blurred shadow edges
++            if (p.shadowEnabled >= 2 ? (bDynamic || bWorld || travelled > 0.0) : (bDynamic && !bWorld)) sun = 0.0;
+             if (p.debugMode == 7) sun = bDynamic ? 0.0 : 1.0;
+             if (p.debugMode == 8) sun = bWorld ? 0.5 : 1.0;
+             if (p.debugMode == 9) sun = bWorld ? 0.5 : (bDynamic ? 0.0 : 1.0);
+@@ -378,6 +380,19 @@ kernel void temporal(constant Params& p [[buffer(0)]],
+                     // this frame keep the reprojected history
+                     float4 rh = reflHistoryTex.sample(s, puv);
+                     if (!(rh.a >= 0.0 && rh.a <= 1.0)) rh = float4(0.0);	// never accumulated (or NaN)
++                    // clip the history against this frame's traced neighbours (the checkerboard leaves
++                    // about half of the 5x5 valid), so a reflected object that moved does not trail
++                    float4 rm1 = 0.0, rm2 = 0.0; float rn = 0.0;
++                    for (int dy = -2; dy <= 2; dy++) for (int dx = -2; dx <= 2; dx++) {
++                        int2 q = clamp(int2(gid) + int2(dx, dy), int2(0), int2(p.halfW - 1, p.halfH - 1));
++                        float4 s2 = reflRawTex.read(uint2(q));
++                        if (s2.a < 0.0) continue;
++                        rm1 += s2; rm2 += s2 * s2; rn += 1.0;
++                    }
++                    if (rn > 0.0) {
++                        float4 rmean = rm1 / rn, rsig = sqrt(max(rm2 / rn - rmean * rmean, 0.0));
++                        rh = clamp(rh, rmean - 1.5 * rsig - 0.03, rmean + 1.5 * rsig + 0.03);
++                    }
+                     float rw = 1.0 / (clamp(count, 4.0, 12.0) + 1.0);   // at least a few frames of blending, or the checkerboard shimmers
+                     reflAcc = reflRaw.a < 0.0 ? rh : mix(rh, reflRaw, rw);
+                 }
+-- 
+2.55.0
+

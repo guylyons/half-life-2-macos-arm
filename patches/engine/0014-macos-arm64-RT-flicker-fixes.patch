@@ -1,7 +1,7 @@
 From 6d7762cba3d0b534defe037b5cbc931a5dcf92b6 Mon Sep 17 00:00:00 2001
 From: Guy Lyons <guylyons2@gmail.com>
 Date: Thu, 10 Sep 2026 08:14:06 -0400
-Subject: [PATCH 14/14] macos-arm64: RT flicker fixes
+Subject: [PATCH 14/15] macos-arm64: RT flicker fixes
 
 - The view model was drawn after the depth capture, so the layer applied
   the ground's occlusion and reflections to the gun, sliding over it as it

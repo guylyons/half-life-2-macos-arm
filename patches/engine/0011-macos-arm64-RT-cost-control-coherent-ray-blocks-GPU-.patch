@@ -1,7 +1,7 @@
 From e9488c6286ec9dab3094aa2fb22ef3ce5e452f45 Mon Sep 17 00:00:00 2001
 From: Guy Lyons <guylyons2@gmail.com>
 Date: Thu, 10 Sep 2026 01:38:11 -0400
-Subject: [PATCH 11/14] macos-arm64: RT cost control: coherent ray blocks, GPU
+Subject: [PATCH 11/15] macos-arm64: RT cost control: coherent ray blocks, GPU
  budget, 64-unit AO radius
 
 Enclosed scenes (tunnels, corridors) cost up to 3x the open-air trace on the
