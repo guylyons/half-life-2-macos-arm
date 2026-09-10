@@ -1,0 +1,437 @@
+From b20720d6fbd703d46cda8e542935ee1cdfd99c16 Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Wed, 9 Sep 2026 23:58:55 -0400
+Subject: [PATCH 8/8] macos-arm64: sun shadows from dynamic objects, on by
+ default
+
+The sun direction now follows vrad's construction (SetupLightNormalFromProps,
+negated); the previous AngleVectors form was mirrored in the horizontal plane.
+Shadow rays only darken where a dynamic object blocks a point the world brushes
+leave sunlit, so the lightmaps' own shadows are not doubled. Static props are a
+separate instance so tree branches and rooftop props (which vrad did not shadow
+with) do not count as baked shadow. Instance masks proved unreliable on the M1
+software tracer, so hits are walked and classified by instance id instead. A
+per-object bounds pre-test keeps the shadow ray cost to the objects' footprints.
+rt_dump_world writes the traced world triangles for offline checks.
+---
+ game/client/rt_layer.cpp    | 81 ++++++++++++++++++++++++------
+ public/rtmetal/iraytracer.h |  6 +++
+ rtmetal/rtmetal.mm          | 98 ++++++++++++++++++++++++++++++++-----
+ 3 files changed, 159 insertions(+), 26 deletions(-)
+
+diff --git a/game/client/rt_layer.cpp b/game/client/rt_layer.cpp
+index 4de4b38..3168b03 100644
+--- a/game/client/rt_layer.cpp
++++ b/game/client/rt_layer.cpp
+@@ -35,17 +35,17 @@
+ 
+ static ConVar rt_enable( "rt_enable", "1", FCVAR_ARCHIVE, "Ray-traced lighting layer (ambient occlusion and sun shadows)." );
+ static ConVar rt_ao( "rt_ao", "1", FCVAR_ARCHIVE, "Ray-traced ambient occlusion." );
+-static ConVar rt_shadows( "rt_shadows", "0", FCVAR_ARCHIVE, "Ray-traced sun shadows (world only for now: mostly duplicates the lightmaps, so off by default)." );
++static ConVar rt_shadows( "rt_shadows", "1", FCVAR_ARCHIVE, "Ray-traced sun shadows from dynamic objects (NPCs, physics props, doors) onto sunlit surfaces." );
+ static ConVar rt_ao_radius( "rt_ao_radius", "96", FCVAR_ARCHIVE, "AO ray length in world units." );
+ static ConVar rt_ao_strength( "rt_ao_strength", "0.8", FCVAR_ARCHIVE, "AO darkening, 0..1." );
+-static ConVar rt_shadow_strength( "rt_shadow_strength", "0.6", FCVAR_ARCHIVE, "Sun shadow darkening, 0..1." );
++static ConVar rt_shadow_strength( "rt_shadow_strength", "0.7", FCVAR_ARCHIVE, "Sun shadow darkening, 0..1." );
+ static ConVar rt_sun_angle( "rt_sun_angle", "1.0", FCVAR_ARCHIVE, "Sun angular radius in degrees (soft shadows)." );
+ static ConVar rt_divisor( "rt_divisor", "2", FCVAR_ARCHIVE, "Trace resolution divisor (1 = full, 2 = half)." );
+ static ConVar rt_ao_rays( "rt_ao_rays", "2", FCVAR_ARCHIVE, "AO rays per pixel per frame." );
+ static ConVar rt_static_props( "rt_static_props", "1", FCVAR_ARCHIVE, "Include static props in the ray-traced geometry (takes effect on map load)." );
+ static ConVar rt_dynamic( "rt_dynamic", "2", FCVAR_ARCHIVE, "Dynamic objects in the ray-traced geometry: 0 none, 1 rigid only (physics props, doors, brush entities), 2 also skinned (NPCs, ragdolls)." );
+ static ConVar rt_dynamic_range( "rt_dynamic_range", "3000", FCVAR_ARCHIVE, "Dynamic objects further than this from the camera are left out." );
+-static ConVar rt_debug( "rt_debug", "0", 0, "0 off, 1 AO, 2 shadows, 3 normals, 4 depth." );
++static ConVar rt_debug( "rt_debug", "0", 0, "0 off, 1 AO, 2 sun shadows, 3 normals, 4 depth, 7 any dynamic sun hit, 8 world sun hit, 9 both." );
+ static ConVar rt_stats( "rt_stats", "0", 0, "Print ray tracing timing to the console periodically." );
+ 
+ static IRayTracer *s_pRayTracer = NULL;
+@@ -230,6 +230,7 @@ struct RTModelTris_t
+ 
+ static CUtlMap<const model_t *, RTModelTris_t *> s_ModelTris( DefLessFunc( const model_t * ) );
+ static CUtlVector<int> s_BrushMeshes;		// tracer mesh per BSP model index (0 = none)
++static int s_nStaticPropMesh = 0;			// all static props, world space, one mesh
+ 
+ static void ClearModelCache()
+ {
+@@ -241,6 +242,7 @@ static void ClearModelCache()
+ 	}
+ 	s_ModelTris.RemoveAll();
+ 	s_BrushMeshes.RemoveAll();
++	s_nStaticPropMesh = 0;
+ }
+ 
+ static bool IsIdentity( const matrix3x4_t &m )
+@@ -379,6 +381,18 @@ static void UpdateDynamicInstances( const CViewSetup &view )
+ 		return;
+ 	s_Instances.RemoveAll();
+ 	s_BonePool.RemoveAll();
++	if ( s_nStaticPropMesh )
++	{
++		RTInstance inst;
++		inst.m_nMesh = s_nStaticPropMesh;
++		inst.m_nKey = 0xFFFFFFFFu;
++		inst.m_nBoneOffset = -1;
++		inst.m_nBones = 0;
++		inst.m_nFlags = RT_INSTANCE_STATIC_PROP;
++		SetIdentityMatrix( *(matrix3x4_t *)inst.m_modelToWorld );
++		for ( int k = 0; k < 3; k++ ) { inst.m_vMins[k] = -16384.0f; inst.m_vMaxs[k] = 16384.0f; }
++		s_Instances.AddToTail( inst );
++	}
+ 	if ( rt_dynamic.GetBool() )
+ 	{
+ 		C_BaseAnimating::AutoAllowBoneAccess boneaccess( true, false );
+@@ -402,6 +416,10 @@ static void UpdateDynamicInstances( const CViewSetup &view )
+ 			inst.m_nKey = (unsigned int)pEnt->GetRefEHandle().ToInt();
+ 			inst.m_nBoneOffset = -1;
+ 			inst.m_nBones = 0;
++			inst.m_nFlags = 0;
++			Vector vMins, vMaxs;
++			pEnt->GetRenderBoundsWorldspace( vMins, vMaxs );
++			for ( int k = 0; k < 3; k++ ) { inst.m_vMins[k] = vMins[k]; inst.m_vMaxs[k] = vMaxs[k]; }
+ 			if ( nType == mod_brush )
+ 			{
+ 				const char *pName = modelinfo->GetModelName( pModel );
+@@ -521,17 +539,28 @@ static Vector FindSunDirection()
+ 	QAngle angles( 0, 0, 0 );
+ 	const char *pAngles = pKV->GetString( "angles", "0 0 0" );
+ 	sscanf( pAngles, "%f %f %f", &angles.x, &angles.y, &angles.z );
+-	float pitch = angles.x;
+-	if ( pKV->FindKey( "pitch" ) )
+-		pitch = pKV->GetFloat( "pitch" );
+-	else
+-		pitch = -pitch;
++	float pitch = pKV->GetFloat( "pitch", 0.0f );
++	float angle = pKV->GetFloat( "angle", 0.0f );
+ 	pKV->deleteThis();
+-	// light_environment's pitch is inverted relative to QAngle: negative = light shines downward,
+-	// so AngleVectors with the raw pitch yields the direction toward the sun.
+-	Vector fwd;
+-	AngleVectors( QAngle( pitch, angles.y, 0 ), &fwd );
+-	return fwd.Normalized();
++	// Same construction as vrad (SetupLightNormalFromProps in public/map_utils.cpp): the result is the
++	// direction the light travels; vrad traces toward the sun along its negation.
++	Vector normal;
++	if ( angle == -1.0f )		// ANGLE_UP
++		normal.Init( 0, 0, 1 );
++	else if ( angle == -2.0f )	// ANGLE_DOWN
++		normal.Init( 0, 0, -1 );
++	else
++	{
++		if ( angle == 0.0f )
++			angle = angles.y;
++		normal.Init( cosf( DEG2RAD( angle ) ), sinf( DEG2RAD( angle ) ), 0 );
++	}
++	if ( pitch == 0.0f )
++		pitch = angles.x;
++	normal.z = sinf( DEG2RAD( pitch ) );
++	normal.x *= cosf( DEG2RAD( pitch ) );
++	normal.y *= cosf( DEG2RAD( pitch ) );
++	return ( -normal ).Normalized();
+ }
+ 
+ //-----------------------------------------------------------------------------
+@@ -559,10 +588,15 @@ public:
+ 			return;
+ 		}
+ 		int nWorldTris = indices.Count() / 3;
++		pRT->SetWorldGeometry( verts.Base(), verts.Count() / 3, indices.Base(), indices.Count() / 3 );
+ 		int nPropTris = 0, nProps = 0;
+ 		if ( rt_static_props.GetBool() )
+-			nPropTris = AppendStaticProps( verts, indices, &nProps );
+-		pRT->SetWorldGeometry( verts.Base(), verts.Count() / 3, indices.Base(), indices.Count() / 3 );
++		{
++			CUtlVector<float> pv; CUtlVector<unsigned int> pi;
++			nPropTris = AppendStaticProps( pv, pi, &nProps );
++			if ( nPropTris > 0 )
++				s_nStaticPropMesh = pRT->CreateMesh( pv.Base(), pv.Count() / 3, pi.Base(), pi.Count() / 3, NULL, NULL );
++		}
+ 		// brush entities (doors, trains, breakables): one mesh per BSP model, instanced per frame
+ 		int nBrushModels = BspModelCount( (const byte *)buf.Base() ), nBrushTris = 0;
+ 		s_BrushMeshes.SetCount( nBrushModels );
+@@ -695,6 +729,23 @@ CON_COMMAND( rt_list_props, "List static props (model, origin, triangles in the
+ 	}
+ }
+ 
++CON_COMMAND( rt_dump_world, "Write the world triangles used for ray tracing to rt_world.bin (float3 verts, then uint32 index triples)" )
++{
++	CUtlBuffer buf;
++	if ( !filesystem->ReadFile( engine->GetLevelName(), "GAME", buf ) )
++		return;
++	CUtlVector<float> verts; CUtlVector<unsigned int> indices;
++	if ( !ExtractBspModel( (const byte *)buf.Base(), 0, verts, indices ) )
++		return;
++	CUtlBuffer out;
++	int nV = verts.Count() / 3, nI = indices.Count();
++	out.Put( &nV, 4 ); out.Put( &nI, 4 );
++	out.Put( verts.Base(), verts.Count() * sizeof( float ) );
++	out.Put( indices.Base(), indices.Count() * sizeof( unsigned int ) );
++	filesystem->WriteFile( "rt_world.bin", "DEFAULT_WRITE_PATH", out );
++	Msg( "[rt] wrote rt_world.bin: %d verts, %d triangles\n", nV, nI / 3 );
++}
++
+ CON_COMMAND( rt_status, "Ray tracing layer status" )
+ {
+ 	IRayTracer *pRT = GetRayTracer();
+diff --git a/public/rtmetal/iraytracer.h b/public/rtmetal/iraytracer.h
+index 8c1a4ec..6174921 100644
+--- a/public/rtmetal/iraytracer.h
++++ b/public/rtmetal/iraytracer.h
+@@ -36,8 +36,14 @@ struct RTInstance
+ 	float			m_modelToWorld[12];	// row-major 3x4, as matrix3x4_t
+ 	int				m_nBoneOffset;		// index into the bone matrix pool (row-major 3x4 pose-to-world per bone), -1 for rigid
+ 	int				m_nBones;
++	int				m_nFlags;			// RT_INSTANCE_*
++	float			m_vMins[3], m_vMaxs[3];	// world-space bounds (sun shadow rays are only traced toward these)
+ };
+ 
++// Static props: occlude AO and cast nothing new, and (unlike world brushes) do not count as
++// "already shadowed in the lightmaps" for the sun test, since vrad shadowed with their hulls at best.
++#define RT_INSTANCE_STATIC_PROP	1
++
+ abstract_class IRayTracer
+ {
+ public:
+diff --git a/rtmetal/rtmetal.mm b/rtmetal/rtmetal.mm
+index 2736fa2..479c32c 100644
+--- a/rtmetal/rtmetal.mm
++++ b/rtmetal/rtmetal.mm
+@@ -38,9 +38,18 @@ struct Params {
+     float shadowStrength; float sunCosAngle; int frame; int debugMode;
+     int aoEnabled; int shadowEnabled; int fullW; int fullH;
+     int halfW; int halfH; int hasSun; int historyValid;
+-    int aoRays; int pad0; int pad1; int pad2;
++    int aoRays; int staticPropInstance; int numShadowBoxes; int pad2;
+ };
+ 
++// does the ray from o along d (d.z > 0 assumed nothing) cross the box? slab test
++static bool rayHitsBox(float3 o, float3 d, float3 bmin, float3 bmax) {
++    float3 inv = 1.0 / d;
++    float3 t0 = (bmin - o) * inv, t1 = (bmax - o) * inv;
++    float3 tmin3 = min(t0, t1), tmax3 = max(t0, t1);
++    float tmin = max(max(tmin3.x, tmin3.y), tmin3.z), tmax = min(min(tmax3.x, tmax3.y), tmax3.z);
++    return tmax >= max(tmin, 0.0);
++}
++
+ // depth packed by togl: hi/mid/lo bytes of a 24-bit depth
+ static float unpackDepth(float4 c) {
+     // togl writes GL_BGRA / 8_8_8_8_REV into the surface; Metal reads bgra8Unorm as rgba in that order
+@@ -95,6 +104,8 @@ kernel void skin(constant uint& nVerts [[buffer(0)]],
+ // half-res: raw visibility (R = ao, G = sun), linear depth in B, normal encoded? keep B=view distance, A = valid
+ kernel void trace(constant Params& p [[buffer(0)]],
+                   instance_acceleration_structure accel [[buffer(1)]],
++                  device float* probe [[buffer(2)]],
++                  device const float* shadowBoxes [[buffer(3)]],
+                   texture2d<float, access::read> depthTex [[texture(0)]],
+                   texture2d<float, access::write> rawTex [[texture(1)]],
+                   texture2d<float, access::write> normalTex [[texture(2)]],
+@@ -143,11 +154,22 @@ kernel void trace(constant Params& p [[buffer(0)]],
+         }
+         ao = sum / float(n);
+     }
++    // Sun shadows only from dynamic objects: the lightmaps already hold the static world's shadows.
++    // A point the static world shadows (or that faces away from the sun) is left alone; a point the
++    // static world lights but a dynamic object blocks is darkened.
+     float sun = 1.0;
+     if (p.shadowEnabled && p.hasSun) {
+         float3 sunDir = float3(p.sunDir);
+         float ndl = dot(N, sunDir);
++        bool bNearDynamic = false;
+         if (ndl > 0.0) {
++            for (int i = 0; i < p.numShadowBoxes; i++) {
++                float3 bmin = float3(shadowBoxes[i*6], shadowBoxes[i*6+1], shadowBoxes[i*6+2]);
++                float3 bmax = float3(shadowBoxes[i*6+3], shadowBoxes[i*6+4], shadowBoxes[i*6+5]);
++                if (rayHitsBox(origin, sunDir, bmin, bmax)) { bNearDynamic = true; break; }
++            }
++        }
++        if (ndl > 0.0 && bNearDynamic) {
+             // jitter within the cone
+             float3 t = normalize(cross(abs(sunDir.x) > 0.5 ? float3(0,1,0) : float3(1,0,0), sunDir));
+             float3 b = cross(sunDir, t);
+@@ -155,8 +177,28 @@ kernel void trace(constant Params& p [[buffer(0)]],
+             float cosA = mix(p.sunCosAngle, 1.0, u1), sinA = sqrt(1.0 - cosA * cosA), phi = 6.28318530718 * u2;
+             float3 dir = normalize(sunDir * cosA + t * (sinA * cos(phi)) + b * (sinA * sin(phi)));
+             ray r; r.origin = origin; r.direction = dir; r.min_distance = 0.0; r.max_distance = 16384.0;
+-            intersection_result<triangle_data, instancing> res = isect.intersect(r, accel);
+-            if (res.type != intersection_type::none) sun = 0.0;
++            // Walk the hits along the ray (instance masks are not reliable on every device): a world-brush
++            // hit means the lightmap already has this shadow; a static prop hit is skipped (vrad shadowed
++            // with hulls at best, and the lightmap is what we see); a dynamic hit with no world brush
++            // behind it darkens.
++            bool bDynamic = false, bWorld = false;
++            float travelled = 0.0;
++            for (int step = 0; step < 4; step++) {
++                intersection_result<triangle_data, instancing> res = isect.intersect(r, accel);
++                if (res.type == intersection_type::none) break;
++                if (res.instance_id == 0) { bWorld = true; break; }
++                if (int(res.instance_id) != p.staticPropInstance) bDynamic = true;
++                travelled += res.distance + 0.5;
++                r.origin = origin + dir * travelled;
++                r.max_distance = 16384.0 - travelled;
++                if (p.debugMode >= 9 && all(gid == uint2(p.halfW / 2, p.halfH * 3 / 4)) && step == 0) {
++                    probe[0] = origin.x; probe[1] = origin.y; probe[2] = origin.z; probe[3] = dir.x; probe[4] = dir.y; probe[5] = dir.z;
++                    probe[6] = res.distance; probe[7] = float(res.instance_id); probe[8] = float(res.primitive_id); probe[9] = N.x; probe[10] = N.y; probe[11] = N.z; }
++            }
++            if (bDynamic && !bWorld) sun = 0.0;
++            if (p.debugMode == 7) sun = bDynamic ? 0.0 : 1.0;
++            if (p.debugMode == 8) sun = bWorld ? 0.5 : 1.0;
++            if (p.debugMode == 9) sun = bWorld ? 0.5 : (bDynamic ? 0.0 : 1.0);
+         }
+     }
+     rawTex.write(float4(ao, sun, dist, 1.0), gid);
+@@ -180,7 +222,7 @@ kernel void temporal(constant Params& p [[buffer(0)]],
+     float2 uv = (float2(px) + 0.5) / float2(p.fullW, p.fullH);
+     float3 P = reconstruct(p, uv, d);
+     float count = 0.0; float2 acc = raw.rg;
+-    if (p.historyValid) {
++    if (p.historyValid && p.debugMode < 7) {
+         float4 prev = p.prevWorldToProj * float4(P, 1.0);
+         if (prev.w > 0.0) {
+             float2 pndc = prev.xy / prev.w;
+@@ -274,6 +316,7 @@ kernel void composite(constant Params& p [[buffer(0)]],
+         else if (p.debugMode == 4) { float v = saturate(dist / 2048.0); out = float4(v, v, v, 1.0); }
+         else if (p.debugMode == 5) { float v = (d - 0.9) * 10.0; out = float4(saturate(v), saturate(v), saturate(v), 1.0); }
+         else if (p.debugMode == 6) { float3 P = reconstruct(p, uv, d); out = float4(fract(P / 256.0), 1.0); }
++        else if (p.debugMode >= 7) out = float4(best.g, best.g, best.g, 1.0);
+     } else if (p.debugMode != 0) {
+         out = float4(0.0, 0.0, 0.0, 1.0);
+     }
+@@ -289,7 +332,7 @@ struct RTParamsGPU
+ 	float shadowStrength; float sunCosAngle; int frame; int debugMode;
+ 	int aoEnabled; int shadowEnabled; int fullW; int fullH;
+ 	int halfW; int halfH; int hasSun; int historyValid;
+-	int aoRays; int pad0; int pad1; int pad2;
++	int aoRays; int staticPropInstance; int numShadowBoxes; int pad2;
+ };
+ 
+ // A dynamic mesh: rest-pose geometry in model space. Rigid meshes carry a prebuilt BVH;
+@@ -319,7 +362,7 @@ public:
+ 	CRayTracerMetal() : m_bInit( false ), m_bAvailable( false ), m_pDevice( nil ), m_pQueue( nil ), m_pAccel( nil ), m_pPendingAccel( nil ),
+ 		m_depthSurface( NULL ), m_resultSurface( NULL ), m_nFullW( 0 ), m_nFullH( 0 ), m_nHalfW( 0 ), m_nHalfH( 0 ), m_nHistoryIndex( 0 ), m_bHistoryValid( false ),
+ 		m_pfnGetBackbufferInfo( NULL ), m_pfnResolveDepth( NULL ), m_pfnComposite( NULL ), m_bDepthCaptured( false ), m_flTimeResolve( 0 ), m_flTimeMetalWall( 0 ), m_flTimeMetalGPU( 0 ), m_flTimeComposite( 0 ), m_nTimedFrames( 0 ),
+-		m_nNextMesh( 1 ), m_bPendingInstances( false ), m_pInstanceDescBuffer( nil ), m_pInstanceScratch( nil ), m_pInstanceAS( nil ), m_nInstanceCapacity( 0 ), m_nFrameCounter( 0 ), m_nLastInstanceCount( 0 ), m_nLastSkinnedCount( 0 ), m_flTimeDynamic( 0 ), m_pSkin( nil ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; }
++		m_nNextMesh( 1 ), m_bPendingInstances( false ), m_pInstanceDescBuffer( nil ), m_pInstanceScratch( nil ), m_pProbe( nil ), m_pShadowBoxes( nil ), m_nShadowBoxes( 0 ), m_nShadowBoxCapacity( 0 ), m_pInstanceAS( nil ), m_nInstanceCapacity( 0 ), m_nFrameCounter( 0 ), m_nLastInstanceCount( 0 ), m_nLastSkinnedCount( 0 ), m_nStaticPropInstance( -1 ), m_flTimeDynamic( 0 ), m_pSkin( nil ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; }
+ 
+ 	virtual bool Init() OVERRIDE;
+ 	virtual bool IsAvailable() OVERRIDE { return m_bAvailable; }
+@@ -350,10 +393,11 @@ private:
+ 	std::vector<float> m_pendingBones, m_frameBones;
+ 	bool m_bPendingInstances;
+ 	std::map<unsigned int, RTSkinnedInstance_t> m_skinned;
+-	id<MTLBuffer> m_pInstanceDescBuffer, m_pInstanceScratch;
++	id<MTLBuffer> m_pInstanceDescBuffer, m_pInstanceScratch, m_pProbe, m_pShadowBoxes;
++	int m_nShadowBoxes, m_nShadowBoxCapacity;
+ 	id<MTLAccelerationStructure> m_pInstanceAS;
+ 	int m_nInstanceCapacity;
+-	int m_nFrameCounter, m_nLastInstanceCount, m_nLastSkinnedCount;
++	int m_nFrameCounter, m_nLastInstanceCount, m_nLastSkinnedCount, m_nStaticPropInstance;
+ 	double m_flTimeDynamic;
+ 	id<MTLComputePipelineState> m_pSkin;
+ 
+@@ -597,20 +641,27 @@ bool CRayTracerMetal::EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArra
+ 	static const float s_identity[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
+ 	PackTransform( s_identity, &d.transformationMatrix );
+ 	d.options = MTLAccelerationStructureInstanceOptionOpaque;
+-	d.mask = 0xFF;
++	d.mask = 1;		// world brushes; static props 4, dynamic objects 2 (sun shadows come from dynamic objects only)
+ 	d.accelerationStructureIndex = 0;
+ 	descs.push_back( d );
+ 
+ 	id<MTLComputeCommandEncoder> ce = nil;
+ 	id<MTLAccelerationStructureCommandEncoder> ae = nil;
+-	int nSkinned = 0;
++	int nSkinned = 0, nStaticPropInstance = -1;
+ 	// 1) skinning for every skinned instance (compute), 2) builds/refits (AS encoder)
+ 	std::vector<std::pair<RTSkinnedInstance_t *, const RTMesh_t *>> skinnedThisFrame;
++	std::vector<float> boxes;
+ 	for ( const RTInstance &inst : m_frameInstances )
+ 	{
+ 		auto mit = m_meshes.find( inst.m_nMesh );
+ 		if ( mit == m_meshes.end() )
+ 			continue;
++		if ( !( inst.m_nFlags & RT_INSTANCE_STATIC_PROP ) )
++		{
++			// pad a little: the bounds are the renderer's, the traced mesh may poke out
++			for ( int k = 0; k < 3; k++ ) boxes.push_back( inst.m_vMins[k] - 4.0f );
++			for ( int k = 0; k < 3; k++ ) boxes.push_back( inst.m_vMaxs[k] + 4.0f );
++		}
+ 		const RTMesh_t &mesh = mit->second;
+ 		if ( !mesh.bSkinned || inst.m_nBoneOffset < 0 || inst.m_nBones <= 0 )
+ 		{
+@@ -622,6 +673,8 @@ bool CRayTracerMetal::EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArra
+ 			else idx = pi->second;
+ 			PackTransform( inst.m_modelToWorld, &d.transformationMatrix );
+ 			d.accelerationStructureIndex = idx;
++			d.mask = ( inst.m_nFlags & RT_INSTANCE_STATIC_PROP ) ? 4 : 2;
++			if ( inst.m_nFlags & RT_INSTANCE_STATIC_PROP ) nStaticPropInstance = (int)descs.size();
+ 			descs.push_back( d );
+ 			continue;
+ 		}
+@@ -663,6 +716,7 @@ bool CRayTracerMetal::EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArra
+ 		[prims addObject:sk.as];
+ 		PackTransform( s_identity, &d.transformationMatrix );	// already in world space
+ 		d.accelerationStructureIndex = idx;
++		d.mask = 2;
+ 		descs.push_back( d );
+ 	}
+ 	if ( ce )
+@@ -721,7 +775,18 @@ bool CRayTracerMetal::EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArra
+ 	[ae buildAccelerationStructure:m_pInstanceAS descriptor:idesc scratchBuffer:m_pInstanceScratch scratchBufferOffset:0];
+ 	[ae endEncoding];
+ 
+-	m_nLastInstanceCount = nInst - 1;
++	m_nLastInstanceCount = nInst - 1;	// includes the static prop instance
++	m_nStaticPropInstance = nStaticPropInstance;
++	m_nShadowBoxes = (int)boxes.size() / 6;
++	if ( m_nShadowBoxes > m_nShadowBoxCapacity || !m_pShadowBoxes )
++	{
++		int cap = m_nShadowBoxes < 256 ? 256 : m_nShadowBoxes * 2;
++		[m_pShadowBoxes release];
++		m_pShadowBoxes = [m_pDevice newBufferWithLength:(size_t)cap * 6 * sizeof( float ) options:MTLResourceStorageModeShared];
++		m_nShadowBoxCapacity = cap;
++	}
++	if ( m_nShadowBoxes > 0 )
++		memcpy( [m_pShadowBoxes contents], boxes.data(), boxes.size() * sizeof( float ) );
+ 	m_nLastSkinnedCount = nSkinned;
+ 	*ppInstanceAS = m_pInstanceAS;
+ 	*ppPrimitiveASes = prims;
+@@ -830,6 +895,7 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 		gp.hasSun = sunLen > 0.5f;
+ 		gp.historyValid = m_bHistoryValid;
+ 		gp.aoRays = params.m_nAORays > 0 ? params.m_nAORays : 1;
++		gp.staticPropInstance = -1;	// set after the dynamic scene is encoded
+ 
+ 		double t0 = CFAbsoluteTimeGetCurrent();
+ 		id<MTLTexture> histIn = m_pHistory[m_nHistoryIndex], histOut = m_pHistory[m_nHistoryIndex ^ 1];
+@@ -841,6 +907,8 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 		if ( !EncodeDynamicScene( cb, keepAlive, &instanceAS, &prims, &nInst ) )
+ 			return false;
+ 		m_flTimeDynamic += ( CFAbsoluteTimeGetCurrent() - tDyn ) * 1000.0;
++		gp.staticPropInstance = m_nStaticPropInstance;
++		gp.numShadowBoxes = m_nShadowBoxes;
+ 
+ 		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+ 		MTLSize tg = MTLSizeMake( 8, 8, 1 );
+@@ -849,6 +917,9 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 		[ce setComputePipelineState:m_pTrace];
+ 		[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
+ 		[ce setAccelerationStructure:instanceAS atBufferIndex:1];
++		if ( !m_pProbe ) m_pProbe = [m_pDevice newBufferWithLength:64 options:MTLResourceStorageModeShared];
++		[ce setBuffer:m_pProbe offset:0 atIndex:2];
++		[ce setBuffer:m_pShadowBoxes offset:0 atIndex:3];
+ 		for ( id<MTLAccelerationStructure> prim in prims )
+ 			[ce useResource:prim usage:MTLResourceUsageRead];
+ 		[ce setTexture:m_pDepthTex atIndex:0]; [ce setTexture:m_pRawTex atIndex:1]; [ce setTexture:m_pNormalTex atIndex:2];
+@@ -891,6 +962,11 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 		m_flTimeMetalGPU += ( cb.GPUEndTime - cb.GPUStartTime ) * 1000.0;
+ 		m_flTimeMetalWall += ( CFAbsoluteTimeGetCurrent() - t0 ) * 1000.0;
+ 
++		if ( params.m_nDebugMode >= 9 && ( params.m_nFrame % 60 ) == 0 )
++		{
++			const float *pr = (const float *)[m_pProbe contents];
++			Msg( "[rt] probe: origin %.1f %.1f %.1f dir %.4f %.4f %.4f N %.3f %.3f %.3f hit dist %.1f instance %.0f prim %.0f\n", pr[0], pr[1], pr[2], pr[3], pr[4], pr[5], pr[9], pr[10], pr[11], pr[6], pr[7], pr[8] );
++		}
+ 		m_nHistoryIndex ^= 1;
+ 		m_bHistoryValid = true;
+ 		memcpy( m_prevWorldToProj, params.m_worldToProjection, sizeof( m_prevWorldToProj ) );
+-- 
+2.55.0
+
