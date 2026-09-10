@@ -1,7 +1,7 @@
 From 59df1aea9dad5b14e7cbcf2c963cb4d05810bec5 Mon Sep 17 00:00:00 2001
 From: Guy Lyons <guylyons2@gmail.com>
 Date: Wed, 9 Sep 2026 15:09:58 -0400
-Subject: [PATCH 3/9] macos-arm64: Retina support
+Subject: [PATCH 03/10] macos-arm64: Retina support
 
 Create the SDL window high-DPI aware, blit to the real drawable size,
 report the native display size in pixels, and list pixel-sized display

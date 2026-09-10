@@ -1,0 +1,82 @@
+From 0f2f01c794d6591b32ce212fb66cdc0b7b1ef978 Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Thu, 10 Sep 2026 00:22:59 -0400
+Subject: [PATCH 10/10] macos-arm64: RT image quality: bilateral upsample, R2
+ sampling, adaptive blur
+
+Depth-weighted bilinear upsample in the reprojecting composite instead of
+nearest-of-four (no half-resolution blockiness); per-pixel R2 low-discrepancy
+sequences for AO directions so accumulation converges faster than white noise;
+a 7x7 blur while the history is under 4 samples.
+---
+ rtmetal/rtmetal.mm      | 12 +++++++++---
+ togl/linuxwin/glmrt.cpp |  8 ++++++++
+ 2 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/rtmetal/rtmetal.mm b/rtmetal/rtmetal.mm
+index 537574e..85e227d 100644
+--- a/rtmetal/rtmetal.mm
++++ b/rtmetal/rtmetal.mm
+@@ -138,13 +138,19 @@ kernel void trace(constant Params& p [[buffer(0)]],
+     isect.set_triangle_cull_mode(triangle_cull_mode::none);
+     isect.assume_geometry_type(geometry_type::triangle);
+     uint seed = hash(gid.x * 1973u + gid.y * 9277u + uint(p.frame) * 26699u);
++    // per-pixel R2 sequence: each pixel walks a low-discrepancy sequence over frames from its own
++    // random offset, so the accumulated samples converge faster than white noise
++    uint pix = hash(gid.x * 7919u + gid.y * 104729u);
++    float2 r2off = float2(float(pix & 0xFFFFu), float(pix >> 16)) / 65536.0;
+ 
+     float ao = 1.0;
+     if (p.aoEnabled) {
+         float sum = 0.0;
+         int n = max(p.aoRays, 1);
+         for (int i = 0; i < n; i++) {
+-            float3 dir = cosineHemisphere(N, rnd(seed), rnd(seed));
++            float k = float(p.frame * n + i);
++            float2 u = fract(r2off + k * float2(0.7548776662, 0.5698402910));
++            float3 dir = cosineHemisphere(N, u.x, u.y);
+             ray r; r.origin = origin; r.direction = dir; r.min_distance = 0.0; r.max_distance = p.aoRadius;
+             intersection_result<triangle_data, instancing> res = isect.intersect(r, accel);
+             float v = 1.0;
+@@ -271,8 +277,8 @@ kernel void blur(constant Params& p [[buffer(0)]],
+     float4 c = inTex.read(gid);
+     if (c.a == 0.0) { outTex.write(c, gid); return; }
+     float3 n = normalTex.read(gid).xyz;
+-    // fewer samples once the history has converged
+-    int radius = c.a >= 16.0 ? 1 : 2;
++    // wider while the history is young, tighter once it has converged
++    int radius = c.a >= 16.0 ? 1 : (c.a >= 4.0 ? 2 : 3);
+     float2 sum = 0.0; float wsum = 0.0;
+     for (int dy = -radius; dy <= radius; dy++) for (int dx = -radius; dx <= radius; dx++) {
+         int2 q = clamp(int2(gid) + int2(dx, dy), int2(0), int2(p.halfW - 1, p.halfH - 1));
+diff --git a/togl/linuxwin/glmrt.cpp b/togl/linuxwin/glmrt.cpp
+index 78f78db..5a429af 100644
+--- a/togl/linuxwin/glmrt.cpp
++++ b/togl/linuxwin/glmrt.cpp
+@@ -125,15 +125,23 @@ static const char *s_pReprojectFragmentShader =
+ 	"  if ( any( lessThan( puv, vec2( 0.0 ) ) ) || any( greaterThan( puv, vec2( 1.0 ) ) ) ) { gl_FragColor = vec4( 1.0 ); return; }\n"
+ 	"  vec2 hp = puv * halfSize - 0.5;\n"
+ 	"  vec2 base = floor( hp );\n"
++	"  vec2 f = hp - base;\n"
++	"  // depth-weighted bilinear: the 2x2 half-res samples, each weighted by its bilinear weight and by\n"
++	"  // how well its view distance matches this pixel's; a lone matching sample still wins\n"
++	"  vec2 acc = vec2( 0.0 ); float wsum = 0.0; float tol = 0.02 * dist + 2.0;\n"
+ 	"  vec4 best = vec4( 1.0, 1.0, 0.0, 0.0 ); float bestErr = 1e30;\n"
+ 	"  for ( int dy = 0; dy <= 1; dy++ ) for ( int dx = 0; dx <= 1; dx++ ) {\n"
+ 	"    vec2 q = clamp( base + vec2( float( dx ), float( dy ) ), vec2( 0.0 ), halfSize - 1.0 ) + 0.5;\n"
+ 	"    vec4 s = texture2DRect( filteredTex, q );\n"
+ 	"    if ( s.a <= 0.0 ) continue;\n"
+ 	"    float err = abs( s.b - dist );\n"
++	"    float wb = ( dx == 0 ? 1.0 - f.x : f.x ) * ( dy == 0 ? 1.0 - f.y : f.y );\n"
++	"    float w = wb * exp( -err / tol );\n"
++	"    acc += s.rg * w; wsum += w;\n"
+ 	"    if ( err < bestErr ) { bestErr = err; best = s; }\n"
+ 	"  }\n"
+ 	"  if ( bestErr > 0.1 * dist + 8.0 ) { gl_FragColor = vec4( 1.0 ); return; }\n"
++	"  if ( wsum > 1e-4 ) best.rg = acc / wsum;\n"
+ 	"  float ao = mix( 1.0, best.r, aoStrength );\n"
+ 	"  float sun = mix( 1.0, best.g, shadowStrength );\n"
+ 	"  vec4 o = vec4( vec3( ao * sun ), 1.0 );\n"
+-- 
+2.55.0
+
