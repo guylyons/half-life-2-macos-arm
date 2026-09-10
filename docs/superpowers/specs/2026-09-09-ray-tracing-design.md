@@ -97,3 +97,40 @@ and dynamic entities are follow-ons; they receive but do not cast in phase 1.
   buffer, `rt_debug 3` the reconstructed normals.
 - Performance: `cl_showfps 2` at 2560x1440 with RT on stays above 60 fps.
 - Alignment: a moving camera shows no swimming between geometry and AO.
+
+## Implementation status (2026-09-10)
+
+What was built differs from the phase-1 plan above in these ways:
+
+- **Geometry.** Three classes, all in one Metal instance acceleration structure:
+  world brushes and displacements (instance 0); all static props merged into
+  one mesh (pulled through `IStudioRender::GetTriangles`, LOD 0, translucent
+  and alpha-tested materials left out); dynamic objects per frame. Rigid
+  dynamic meshes (physics props, doors, brush entities) carry a prebuilt BVH
+  and are instanced with the entity transform; skinned models (NPCs, ragdolls)
+  are skinned on the GPU from the client's bone matrices into a per-object
+  world-space copy that is refitted every frame. `rt_dynamic 0/1/2`,
+  `rt_static_props`, `rt_list_dynamic`, `rt_list_props`.
+- **Sun shadows** darken only where a dynamic object blocks a point that the
+  world brushes leave sunlit, so the lightmaps' own shadows are not doubled.
+  The sun direction follows vrad's construction (`SetupLightNormalFromProps`,
+  negated). Metal instance masks proved unreliable on the M1 software tracer,
+  so hits are walked along the ray and classified by instance id. A per-object
+  bounds pre-test limits shadow rays to the objects' footprints. On by default.
+- **Pipeline.** Asynchronous with two frames of latency: the depth captured at
+  frame N is traced at N+1 (after a GL fence, never a finish) and composited at
+  N+2 by a GL shader that reconstructs each pixel from the current depth,
+  projects it into the traced frame and takes a depth-weighted bilinear of the
+  half-resolution samples. Three rotating slots of IOSurfaces. The GPU overlaps
+  the GL frame with the tracer; the render thread no longer stalls.
+  `rt_async 0` is the synchronous path.
+- **Denoise.** Temporal accumulation (up to 32 samples) with reprojection and
+  3x3 neighbourhood variance clipping, per-pixel R2 sample sequences, a
+  depth- and normal-aware blur whose radius shrinks as the history converges.
+- **Cost** (M1 Pro, 1512x982, half-resolution trace, plaza scene with 18 NPCs):
+  ~5 ms GPU per traced frame, 176 fps; 62 fps with full-resolution tracing.
+  A bounded GPU wait disables the layer on a hang or fault instead of freezing
+  the game.
+- **Not done:** reflections; alpha-tested geometry (fences, foliage) is absent
+  from the BVH rather than texture-tested; the engine's projected NPC shadows
+  still draw alongside the traced ones.
