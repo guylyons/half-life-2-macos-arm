@@ -1,0 +1,223 @@
+From 91f76701c4e74ebaf24c0f665140d1a5647fe40e Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Wed, 9 Sep 2026 22:07:27 -0400
+Subject: [PATCH 6/6] macos-arm64: static props in the ray-traced geometry
+
+Enumerate the map's static props through IStaticPropMgrClient, pull each
+model's LOD0 triangles once via IStudioRender::GetTriangles, transform per
+instance and append to the world mesh before the BVH build. Translucent and
+alpha-tested materials are left out (no texture lookup in the tracer yet).
+rt_static_props toggles it at map load; rt_list_props lists props with
+origins and triangle counts.
+---
+ game/client/rt_layer.cpp | 162 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 161 insertions(+), 1 deletion(-)
+
+diff --git a/game/client/rt_layer.cpp b/game/client/rt_layer.cpp
+index bd8d3ec..8765db5 100644
+--- a/game/client/rt_layer.cpp
++++ b/game/client/rt_layer.cpp
+@@ -20,6 +20,12 @@
+ #include "mathlib/vmatrix.h"
+ #include "rtmetal/iraytracer.h"
+ #include "view_shared.h"
++#include "istudiorender.h"
++#include "engine/IStaticPropMgr.h"
++#include "engine/ivmodelinfo.h"
++#include "datacache/imdlcache.h"
++#include "model_types.h"
++#include "tier1/utlmap.h"
+ 
+ #include "tier0/memdbgon.h"
+ 
+@@ -34,6 +40,7 @@ static ConVar rt_shadow_strength( "rt_shadow_strength", "0.6", FCVAR_ARCHIVE, "S
+ static ConVar rt_sun_angle( "rt_sun_angle", "1.0", FCVAR_ARCHIVE, "Sun angular radius in degrees (soft shadows)." );
+ static ConVar rt_divisor( "rt_divisor", "2", FCVAR_ARCHIVE, "Trace resolution divisor (1 = full, 2 = half)." );
+ static ConVar rt_ao_rays( "rt_ao_rays", "2", FCVAR_ARCHIVE, "AO rays per pixel per frame." );
++static ConVar rt_static_props( "rt_static_props", "1", FCVAR_ARCHIVE, "Include static props in the ray-traced geometry (takes effect on map load)." );
+ static ConVar rt_debug( "rt_debug", "0", 0, "0 off, 1 AO, 2 shadows, 3 normals, 4 depth." );
+ static ConVar rt_stats( "rt_stats", "0", 0, "Print ray tracing timing to the console periodically." );
+ 
+@@ -194,6 +201,135 @@ static bool ExtractWorldGeometry( const char *pMapName, CUtlVector<float> &verts
+ 	return indices.Count() >= 3;
+ }
+ 
++//-----------------------------------------------------------------------------
++// Studio model triangles (rest pose, model space), cached per model.
++// Translucent and alpha-tested materials are left out: without a texture lookup
++// in the tracer a chain-link fence or a tree's leaf cards would occlude like a
++// solid wall.
++//-----------------------------------------------------------------------------
++struct RTModelTris_t
++{
++	CUtlVector<Vector> verts;
++	CUtlVector<unsigned int> indices;
++};
++
++static CUtlMap<const model_t *, RTModelTris_t *> s_ModelTris( DefLessFunc( const model_t * ) );
++
++static void ClearModelCache()
++{
++	FOR_EACH_MAP_FAST( s_ModelTris, i )
++		delete s_ModelTris[i];
++	s_ModelTris.RemoveAll();
++}
++
++static const RTModelTris_t *GetModelTriangles( const model_t *pModel, int nSkin, int nBody )
++{
++	int idx = s_ModelTris.Find( pModel );
++	if ( idx != s_ModelTris.InvalidIndex() )
++		return s_ModelTris[idx];
++
++	RTModelTris_t *pTris = new RTModelTris_t;
++	s_ModelTris.Insert( pModel, pTris );
++
++	if ( !pModel || modelinfo->GetModelType( pModel ) != mod_studio )
++		return pTris;
++	studiohdr_t *pHdr = modelinfo->GetStudiomodel( pModel );
++	if ( !pHdr || pHdr->numbodyparts == 0 || pHdr->numbones > MAXSTUDIOBONES )
++		return pTris;
++	MDLHandle_t hModel = modelinfo->GetCacheHandle( pModel );
++	studiohwdata_t *pHW = mdlcache->GetHardwareData( hModel );
++	if ( !pHW )
++		return pTris;
++
++	DrawModelInfo_t info;
++	V_memset( &info, 0, sizeof( info ) );
++	info.m_pStudioHdr = pHdr;
++	info.m_pHardwareData = pHW;
++	info.m_Skin = nSkin;
++	info.m_Body = nBody;
++	info.m_Lod = 0;
++	// GetTriangles returns rest-pose vertices; the bone matrices only feed its pose-to-world output, which we ignore
++	static matrix3x4_t s_Identity[MAXSTUDIOBONES];
++	static bool s_bIdentityInit = false;
++	if ( !s_bIdentityInit )
++	{
++		for ( int i = 0; i < MAXSTUDIOBONES; i++ ) SetIdentityMatrix( s_Identity[i] );
++		s_bIdentityInit = true;
++	}
++	GetTriangles_Output_t *pOut = new GetTriangles_Output_t;
++	g_pStudioRender->GetTriangles( info, s_Identity, *pOut );
++
++	for ( int b = 0; b < pOut->m_MaterialBatches.Count(); b++ )
++	{
++		const GetTriangles_MaterialBatch_t &batch = pOut->m_MaterialBatches[b];
++		if ( batch.m_TriListIndices.Count() < 3 || batch.m_Verts.Count() == 0 )
++			continue;
++		if ( batch.m_pMaterial && ( batch.m_pMaterial->IsTranslucent() || batch.m_pMaterial->IsAlphaTested() ) )
++			continue;
++		unsigned int base = pTris->verts.Count();
++		for ( int v = 0; v < batch.m_Verts.Count(); v++ )
++			pTris->verts.AddToTail( batch.m_Verts[v].m_Position );
++		for ( int i = 0; i + 2 < batch.m_TriListIndices.Count(); i += 3 )
++		{
++			int a = batch.m_TriListIndices[i], bb = batch.m_TriListIndices[i+1], c = batch.m_TriListIndices[i+2];
++			if ( a < 0 || bb < 0 || c < 0 || a >= batch.m_Verts.Count() || bb >= batch.m_Verts.Count() || c >= batch.m_Verts.Count() )
++				continue;
++			pTris->indices.AddToTail( base + a ); pTris->indices.AddToTail( base + bb ); pTris->indices.AddToTail( base + c );
++		}
++	}
++	delete pOut;
++	return pTris;
++}
++
++// Appends a rigid instance of a model, transformed by modelToWorld.
++static int AppendModelInstance( const model_t *pModel, int nSkin, int nBody, const matrix3x4_t &modelToWorld, CUtlVector<float> &verts, CUtlVector<unsigned int> &indices )
++{
++	const RTModelTris_t *pTris = GetModelTriangles( pModel, nSkin, nBody );
++	if ( !pTris || pTris->indices.Count() < 3 )
++		return 0;
++	unsigned int base = verts.Count() / 3;
++	for ( int v = 0; v < pTris->verts.Count(); v++ )
++	{
++		Vector w;
++		VectorTransform( pTris->verts[v], modelToWorld, w );
++		verts.AddToTail( w.x ); verts.AddToTail( w.y ); verts.AddToTail( w.z );
++	}
++	for ( int i = 0; i < pTris->indices.Count(); i++ )
++		indices.AddToTail( base + pTris->indices[i] );
++	return pTris->indices.Count() / 3;
++}
++
++static int AppendStaticProps( CUtlVector<float> &verts, CUtlVector<unsigned int> &indices, int *pnProps )
++{
++	*pnProps = 0;
++	if ( !staticpropmgr )
++		return 0;
++	CUtlVector<ICollideable *> props;
++	staticpropmgr->GetAllStaticProps( &props );
++	int nTris = 0;
++	for ( int i = 0; i < props.Count(); i++ )
++	{
++		ICollideable *pProp = props[i];
++		if ( !pProp )
++			continue;
++		int nSkin = 0, nBody = 0;
++		IClientUnknown *pUnk = pProp->GetIClientUnknown();
++		IClientRenderable *pRenderable = pUnk ? pUnk->GetClientRenderable() : NULL;
++		if ( pRenderable )
++		{
++			nSkin = pRenderable->GetSkin();
++			nBody = pRenderable->GetBody();
++		}
++		int n = AppendModelInstance( pProp->GetCollisionModel(), nSkin, nBody, pProp->CollisionToWorldTransform(), verts, indices );
++		if ( n > 0 )
++		{
++			nTris += n;
++			( *pnProps )++;
++		}
++	}
++	return nTris;
++}
++
+ //-----------------------------------------------------------------------------
+ // Sun direction from light_environment
+ //-----------------------------------------------------------------------------
+@@ -252,11 +388,16 @@ public:
+ 			Warning( "[rt] could not extract world geometry from %s\n", engine->GetLevelName() );
+ 			return;
+ 		}
++		int nWorldTris = indices.Count() / 3;
++		int nPropTris = 0, nProps = 0;
++		if ( rt_static_props.GetBool() )
++			nPropTris = AppendStaticProps( verts, indices, &nProps );
++		ClearModelCache();
+ 		pRT->SetWorldGeometry( verts.Base(), verts.Count() / 3, indices.Base(), indices.Count() / 3 );
+ 		s_vSunDir = FindSunDirection();
+ 		s_bWorldLoaded = true;
+ 		s_nFrame = 0;
+-		Msg( "[rt] %s: %d triangles (%.0f ms), sun dir %.2f %.2f %.2f\n", engine->GetLevelName(), indices.Count() / 3, ( Plat_FloatTime() - t0 ) * 1000.0, s_vSunDir.x, s_vSunDir.y, s_vSunDir.z );
++		Msg( "[rt] %s: %d world triangles + %d from %d static props (%.0f ms), sun dir %.2f %.2f %.2f\n", engine->GetLevelName(), nWorldTris, nPropTris, nProps, ( Plat_FloatTime() - t0 ) * 1000.0, s_vSunDir.x, s_vSunDir.y, s_vSunDir.z );
+ 	}
+ 
+ 	virtual void LevelShutdownPreEntity() OVERRIDE
+@@ -350,6 +491,25 @@ void RT_DrawComposite( const CViewSetup &view )
+ 		Msg( "[rt] %s\n", pRT->GetStatus() );
+ }
+ 
++CON_COMMAND( rt_list_props, "List static props (model, origin, triangles in the ray-traced geometry)" )
++{
++	if ( !staticpropmgr )
++		return;
++	CUtlVector<ICollideable *> props;
++	staticpropmgr->GetAllStaticProps( &props );
++	for ( int i = 0; i < props.Count(); i++ )
++	{
++		ICollideable *pProp = props[i];
++		const model_t *pModel = pProp ? pProp->GetCollisionModel() : NULL;
++		if ( !pModel )
++			continue;
++		const RTModelTris_t *pTris = GetModelTriangles( pModel, 0, 0 );
++		const Vector &o = pProp->GetCollisionOrigin();
++		Msg( "[rt] prop %3d %-48s %8.0f %8.0f %8.0f  %d tris\n", i, modelinfo->GetModelName( pModel ), o.x, o.y, o.z, pTris ? pTris->indices.Count() / 3 : 0 );
++	}
++	ClearModelCache();
++}
++
+ CON_COMMAND( rt_status, "Ray tracing layer status" )
+ {
+ 	IRayTracer *pRT = GetRayTracer();
+-- 
+2.55.0
+
