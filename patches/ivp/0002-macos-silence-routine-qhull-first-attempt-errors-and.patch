@@ -1,0 +1,47 @@
+From 97ba83565a10163f8491329a6460a8e1e3c58d6f Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Thu, 10 Sep 2026 00:24:48 -0400
+Subject: [PATCH 2/2] macos: silence routine qhull first-attempt errors and
+ pool growth messages
+
+The point soup hull builder expects the unjoggled qhull attempt to fail on
+flat point sets and retries with joggling; Windows and Linux builds pass a
+NULL error file, macOS did not. The havok pool growth message printed on
+every platform because HK_CHECK is always a macro.
+---
+ havana/havok/hk_base/memory/memory.cpp         | 2 +-
+ ivp_compact_builder/ivp_surbuild_pointsoup.cxx | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/havana/havok/hk_base/memory/memory.cpp b/havana/havok/hk_base/memory/memory.cpp
+index d2a2b20..adc56fb 100644
+--- a/havana/havok/hk_base/memory/memory.cpp
++++ b/havana/havok/hk_base/memory/memory.cpp
+@@ -91,7 +91,7 @@ void *hk_Memory::allocate_real( int size )
+ 	// allocate first block
+ 	if ( size + m_used_end > m_memory_end)
+ 	{
+-#ifdef HK_CHECK
++#if 0	// HK_CHECK is a macro in every build; growing the pool is routine, not worth a console line
+ 		hk_Console::get_instance()->printf("running out of space: block size %i\n", size );
+ #endif
+ 		hk_Memory_Block *b = (hk_Memory_Block *)hk_Memory::aligned_malloc( sizeof(hk_Memory_Block) + HK_MEMORY_EXTRA_BLOCK_SIZE, HK_MEMORY_CACHE_ALIGNMENT );
+diff --git a/ivp_compact_builder/ivp_surbuild_pointsoup.cxx b/ivp_compact_builder/ivp_surbuild_pointsoup.cxx
+index d8ee20d..2365314 100644
+--- a/ivp_compact_builder/ivp_surbuild_pointsoup.cxx
++++ b/ivp_compact_builder/ivp_surbuild_pointsoup.cxx
+@@ -481,9 +481,9 @@ IVP_Compact_Ledge *IVP_SurfaceBuilder_Pointsoup::convert_pointsoup_to_compact_le
+     // starting qhull
+     // --------------
+ 
+-#if defined(PSXII) || defined(WIN32) || defined(LINUX) || defined(GEKKO)
++#if defined(PSXII) || defined(WIN32) || defined(LINUX) || defined(GEKKO) || defined(OSX) || defined(__APPLE__)
+     FILE *outfile = NULL;   // output from qh_produce_output() use NULL to skip qh_produce_output()
+-    FILE *errfile = NULL;   // error messages from qhull code
++    FILE *errfile = NULL;   // error messages from qhull code (the first, unjoggled attempt fails routinely on flat point sets and is retried below)
+ #else
+     FILE *outfile = stderr;     // stdout // output from qh_produce_output() use NULL to skip qh_produce_output()
+     FILE *errfile = stderr;     // stderr // error messages from qhull code
+-- 
+2.55.0
+
