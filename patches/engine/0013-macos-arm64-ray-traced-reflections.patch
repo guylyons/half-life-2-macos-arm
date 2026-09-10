@@ -1,0 +1,1327 @@
+From f31f91a412d95407c0ef20bc547462e8ba0d6122 Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Thu, 10 Sep 2026 03:09:28 -0400
+Subject: [PATCH 13/13] macos-arm64: ray-traced reflections
+
+Surfaces whose material has an environment map reflect; water keeps the
+engine's own mirrored render. Per-triangle material tables (reflectivity,
+tint, flat colour) travel with every mesh: reflectivity comes from
+$envmaptint times the average of the material's mask ($envmapmask, base
+alpha or normal-map alpha, read from the texture's smallest mip), the flat
+colour from the face's lightmap average times the texture's reflectivity.
+A short probe from just above the surface identifies each pixel's triangle;
+one reflected ray (glossy by roughness) per pixel on an alternating
+checkerboard takes the colour from the captured frame when the hit is on
+screen and the flat colour otherwise. Reflections accumulate with their own
+history, are blurred depth-aware, and are composited in a second additive
+pass with a view-dependent falloff. The budget controller drops reflections
+as its second tier. rt_reflections, rt_reflection_strength,
+rt_reflection_roughness, rt_sky_color, rt_list_reflective; rt_debug 5/6.
+---
+ game/client/rt_layer.cpp    | 267 ++++++++++++++++++++++++++++++++--
+ public/rtmetal/iraytracer.h |  17 ++-
+ rtmetal/rtmetal.mm          | 277 +++++++++++++++++++++++++++++++-----
+ togl/linuxwin/glmrt.cpp     |  74 ++++++++--
+ 4 files changed, 571 insertions(+), 64 deletions(-)
+
+diff --git a/game/client/rt_layer.cpp b/game/client/rt_layer.cpp
+index ec00273..3c6421a 100644
+--- a/game/client/rt_layer.cpp
++++ b/game/client/rt_layer.cpp
+@@ -14,6 +14,8 @@
+ #include "ivrenderview.h"
+ #include "materialsystem/imaterialsystem.h"
+ #include "materialsystem/imaterial.h"
++#include "materialsystem/imaterialvar.h"
++#include "materialsystem/itexture.h"
+ #include "tier1/callqueue.h"
+ #include "tier1/KeyValues.h"
+ #include "tier1/interface.h"
+@@ -26,6 +28,7 @@
+ #include "datacache/imdlcache.h"
+ #include "model_types.h"
+ #include "tier1/utlmap.h"
++#include "texture_group_names.h"
+ #include "c_baseanimating.h"
+ #include "cliententitylist.h"
+ 
+@@ -42,13 +45,17 @@ static ConVar rt_shadow_strength( "rt_shadow_strength", "0.7", FCVAR_ARCHIVE, "S
+ static ConVar rt_sun_angle( "rt_sun_angle", "1.0", FCVAR_ARCHIVE, "Sun angular radius in degrees (soft shadows)." );
+ static ConVar rt_divisor( "rt_divisor", "2", FCVAR_ARCHIVE, "Trace resolution divisor (1 = full, 2 = half)." );
+ static ConVar rt_ao_rays( "rt_ao_rays", "2", FCVAR_ARCHIVE, "AO rays per pixel per frame." );
++static ConVar rt_reflections( "rt_reflections", "1", FCVAR_ARCHIVE, "Ray-traced reflections on surfaces with an environment map (metal, tiles, glass). Water keeps the engine's own reflections." );
++static ConVar rt_reflection_strength( "rt_reflection_strength", "0.7", FCVAR_ARCHIVE, "Scales material reflectivity for ray-traced reflections, 0..1." );
++static ConVar rt_reflection_roughness( "rt_reflection_roughness", "0.15", FCVAR_ARCHIVE, "Assumed roughness of environment-mapped surfaces, 0..1 (blurs the reflection)." );
++static ConVar rt_sky_color( "rt_sky_color", "0.35 0.38 0.45", FCVAR_ARCHIVE, "Colour of reflected rays that leave the level, 0..1." );
+ static ConVar rt_static_props( "rt_static_props", "1", FCVAR_ARCHIVE, "Include static props in the ray-traced geometry (takes effect on map load)." );
+ static ConVar rt_dynamic( "rt_dynamic", "2", FCVAR_ARCHIVE, "Dynamic objects in the ray-traced geometry: 0 none, 1 rigid only (physics props, doors, brush entities), 2 also skinned (NPCs, ragdolls)." );
+ static ConVar rt_dynamic_range( "rt_dynamic_range", "3000", FCVAR_ARCHIVE, "Dynamic objects further than this from the camera are left out." );
+ static ConVar rt_async( "rt_async", "1", FCVAR_ARCHIVE, "Trace with two frames of latency so the GPU never stalls (results are reprojected to the current view). 0 = synchronous." );
+ static ConVar rt_coherent( "rt_coherent", "1", FCVAR_ARCHIVE, "Share AO ray directions across 2x2 pixel blocks (faster on software ray tracing; the temporal filter still varies them per frame)." );
+ static ConVar rt_budget( "rt_budget", "7", FCVAR_ARCHIVE, "GPU time budget per traced frame in ms; while the tracer is over it, AO uses one ray per pixel instead of rt_ao_rays. 0 = never reduce." );
+-static ConVar rt_debug( "rt_debug", "0", 0, "0 off, 1 AO, 2 sun shadows, 3 normals, 4 depth, 7 any dynamic sun hit, 8 world sun hit, 9 both." );
++static ConVar rt_debug( "rt_debug", "0", 0, "0 off, 1 AO, 2 sun shadows, 3 normals, 4 depth, 5 reflection colour, 6 reflectivity, 7 any dynamic sun hit, 8 world sun hit, 9 both." );
+ static ConVar rt_stats( "rt_stats", "0", 0, "Print ray tracing timing to the console periodically." );
+ 
+ static IRayTracer *s_pRayTracer = NULL;
+@@ -75,6 +82,142 @@ static IRayTracer *GetRayTracer()
+ 	return s_pRayTracer;
+ }
+ 
++//-----------------------------------------------------------------------------
++// Material classification for reflections: a surface reflects if its material has an
++// environment map. Water is left to the engine's own mirrored render.
++//-----------------------------------------------------------------------------
++// Average colour and alpha of a VTF, from its smallest mip level (VTFs store mips smallest first).
++// Returns false if the file is missing or the format is not handled.
++static bool VTFAverage( const char *pTexName, float *pRGBA )
++{
++	char path[MAX_PATH];
++	V_snprintf( path, sizeof( path ), "materials/%s.vtf", pTexName );
++	V_FixSlashes( path, '/' );
++	V_strlower( path );		// VPK paths are lower case; material files reference textures in mixed case
++	CUtlBuffer buf;
++	if ( !filesystem->ReadFile( path, "GAME", buf ) || buf.TellPut() < 80 )
++		return false;
++	const byte *p = (const byte *)buf.Base();
++	int nSize = buf.TellPut();
++	if ( memcmp( p, "VTF\0", 4 ) != 0 )
++		return false;
++	unsigned int verMajor = *(const unsigned int *)( p + 4 ), verMinor = *(const unsigned int *)( p + 8 );
++	unsigned int headerSize = *(const unsigned int *)( p + 12 );
++	unsigned int imageFormat = *(const unsigned int *)( p + 52 );
++	unsigned int lowResFormat = *(const unsigned int *)( p + 57 );
++	int lowW = p[61], lowH = p[62];
++	unsigned int dataOfs = 0;
++	if ( verMajor == 7 && verMinor >= 3 )
++	{
++		unsigned int nRes = *(const unsigned int *)( p + 68 );
++		const byte *pRes = p + 80;
++		for ( unsigned int i = 0; i < nRes && (unsigned int)( 80 + i * 8 + 8 ) <= headerSize; i++ )
++		{
++			if ( pRes[i*8] == 0x30 && pRes[i*8+1] == 0 && pRes[i*8+2] == 0 )
++				dataOfs = *(const unsigned int *)( pRes + i * 8 + 4 );
++		}
++		if ( !dataOfs ) return false;
++	}
++	else
++	{
++		unsigned int lowSize = ( lowResFormat == 13 && lowW > 0 && lowH > 0 ) ? ( ( lowW + 3 ) / 4 ) * ( ( lowH + 3 ) / 4 ) * 8 : 0;
++		dataOfs = headerSize + lowSize;
++	}
++	if ( dataOfs + 16 > (unsigned int)nSize )
++		return false;
++	const byte *d = p + dataOfs;	// the 1x1 mip
++	auto c565 = []( unsigned short c, float *rgb ) { rgb[0] = ( ( c >> 11 ) & 31 ) / 31.0f; rgb[1] = ( ( c >> 5 ) & 63 ) / 63.0f; rgb[2] = ( c & 31 ) / 31.0f; };
++	switch ( imageFormat )
++	{
++		case 13: { float a[3], b[3]; c565( *(const unsigned short *)d, a ); c565( *(const unsigned short *)( d + 2 ), b ); for ( int i = 0; i < 3; i++ ) pRGBA[i] = 0.5f * ( a[i] + b[i] ); pRGBA[3] = 1.0f; return true; }		// DXT1
++		case 14: { float al = 0; for ( int i = 0; i < 8; i++ ) al += ( d[i] & 15 ) + ( d[i] >> 4 ); pRGBA[3] = al / ( 16.0f * 15.0f );
++				   float a[3], b[3]; c565( *(const unsigned short *)( d + 8 ), a ); c565( *(const unsigned short *)( d + 10 ), b ); for ( int i = 0; i < 3; i++ ) pRGBA[i] = 0.5f * ( a[i] + b[i] ); return true; }	// DXT3
++		case 15: { pRGBA[3] = 0.5f * ( d[0] + d[1] ) / 255.0f;
++				   float a[3], b[3]; c565( *(const unsigned short *)( d + 8 ), a ); c565( *(const unsigned short *)( d + 10 ), b ); for ( int i = 0; i < 3; i++ ) pRGBA[i] = 0.5f * ( a[i] + b[i] ); return true; }	// DXT5
++		case 0: pRGBA[0] = d[0] / 255.0f; pRGBA[1] = d[1] / 255.0f; pRGBA[2] = d[2] / 255.0f; pRGBA[3] = d[3] / 255.0f; return true;		// RGBA8888
++		case 12: pRGBA[0] = d[2] / 255.0f; pRGBA[1] = d[1] / 255.0f; pRGBA[2] = d[0] / 255.0f; pRGBA[3] = d[3] / 255.0f; return true;		// BGRA8888
++		case 16: pRGBA[0] = d[2] / 255.0f; pRGBA[1] = d[1] / 255.0f; pRGBA[2] = d[0] / 255.0f; pRGBA[3] = 1.0f; return true;				// BGRX8888
++		case 2: pRGBA[0] = d[0] / 255.0f; pRGBA[1] = d[1] / 255.0f; pRGBA[2] = d[2] / 255.0f; pRGBA[3] = 1.0f; return true;				// RGB888
++		case 3: pRGBA[0] = d[2] / 255.0f; pRGBA[1] = d[1] / 255.0f; pRGBA[2] = d[0] / 255.0f; pRGBA[3] = 1.0f; return true;				// BGR888
++		case 5: pRGBA[0] = pRGBA[1] = pRGBA[2] = d[0] / 255.0f; pRGBA[3] = 1.0f; return true;											// I8
++		case 6: pRGBA[0] = pRGBA[1] = pRGBA[2] = d[0] / 255.0f; pRGBA[3] = d[1] / 255.0f; return true;									// IA88
++		case 8: pRGBA[0] = pRGBA[1] = pRGBA[2] = 1.0f; pRGBA[3] = d[0] / 255.0f; return true;												// A8
++	}
++	return false;
++}
++
++// Average of a mask texture named by a material var; flDefault when the var is unset or the file unreadable.
++static float MaskAverageFromVar( IMaterial *pMat, const char *pVarName, bool bAlpha, float flDefault )
++{
++	bool bFound = false;
++	IMaterialVar *pVar = pMat->FindVar( pVarName, &bFound, false );
++	if ( !bFound || !pVar || !pVar->IsDefined() )
++		return flDefault;
++	const char *pName = pVar->GetStringValue();
++	if ( !pName || !pName[0] || pName[0] == '<' )
++		return flDefault;
++	float rgba[4];
++	if ( !VTFAverage( pName, rgba ) )
++		return flDefault;
++	return bAlpha ? rgba[3] : ( rgba[0] + rgba[1] + rgba[2] ) / 3.0f;
++}
++
++static bool VarIsSet( IMaterial *pMat, const char *pVarName )
++{
++	bool bFound = false;
++	IMaterialVar *pVar = pMat->FindVar( pVarName, &bFound, false );
++	return bFound && pVar && pVar->IsDefined();
++}
++
++static bool ClassifyReflective( IMaterial *pMat, float *pflReflectivity, float *pTint )
++{
++	pTint[0] = pTint[1] = pTint[2] = 1.0f;
++	*pflReflectivity = 0.0f;
++	if ( !pMat || pMat->IsErrorMaterial() )
++		return false;
++	bool bFound = false;
++	pMat->FindVar( "$reflecttexture", &bFound, false );
++	if ( bFound )
++		return false;		// water
++	IMaterialVar *pEnv = pMat->FindVar( "$envmap", &bFound, false );
++	if ( !bFound || !pEnv || !pEnv->IsDefined() )
++		return false;
++	const char *pName = pEnv->GetStringValue();
++	if ( !pName || !pName[0] )
++		return false;
++	float r = 1.0f;
++	IMaterialVar *pTintVar = pMat->FindVar( "$envmaptint", &bFound, false );
++	if ( bFound && pTintVar )
++	{
++		float t[3] = { 1, 1, 1 };
++		if ( pTintVar->GetType() == MATERIAL_VAR_TYPE_VECTOR ) pTintVar->GetVecValue( t, 3 );
++		else { t[0] = t[1] = t[2] = pTintVar->GetFloatValue(); }
++		float mx = MAX( t[0], MAX( t[1], t[2] ) );
++		if ( mx <= 0.0f ) return false;
++		r = MIN( mx, 1.0f );
++		for ( int i = 0; i < 3; i++ ) pTint[i] = clamp( t[i] / mx, 0.0f, 1.0f );
++	}
++	// Per-pixel masks are not available to the tracer; each mask contributes its average, read
++	// from the texture's smallest mip. The base-alpha mask is inverted in the shaders.
++	if ( VarIsSet( pMat, "$envmapmask" ) )
++		r *= MaskAverageFromVar( pMat, "$envmapmask", false, 0.3f );
++	if ( pMat->GetMaterialVarFlag( MATERIAL_VAR_NORMALMAPALPHAENVMAPMASK ) )
++		r *= MaskAverageFromVar( pMat, "$bumpmap", true, 0.3f );
++	if ( pMat->GetMaterialVarFlag( MATERIAL_VAR_BASEALPHAENVMAPMASK ) )
++		r *= 1.0f - MaskAverageFromVar( pMat, "$basetexture", true, 0.7f );
++	*pflReflectivity = r;
++	return r > 0.01f;
++}
++
++static void MaterialFlatColor( IMaterial *pMat, const Vector &vLight, float *pFlat )
++{
++	Vector refl( 0.5f, 0.5f, 0.5f );
++	if ( pMat && !pMat->IsErrorMaterial() )
++		pMat->GetReflectivity( refl );
++	for ( int i = 0; i < 3; i++ )
++		pFlat[i] = powf( clamp( refl[i] * vLight[i], 0.0f, 1.0f ), 1.0f / 2.2f );
++}
++
+ //-----------------------------------------------------------------------------
+ // BSP world geometry extraction
+ //-----------------------------------------------------------------------------
+@@ -86,7 +229,7 @@ template <class T> static const T *Lump( const byte *pBase, const dheader_t *pHe
+ }
+ 
+ // Appends the triangles of BSP model nModel (0 = world, 1.. = brush entities, in model space).
+-static bool ExtractBspModel( const byte *pBase, int nModel, CUtlVector<float> &verts, CUtlVector<unsigned int> &indices )
++static bool ExtractBspModel( const byte *pBase, int nModel, CUtlVector<float> &verts, CUtlVector<unsigned int> &indices, CUtlVector<unsigned int> *pTriMats = NULL )
+ {
+ 	const dheader_t *pHeader = (const dheader_t *)pBase;
+ 	if ( pHeader->ident != IDBSPHEADER )
+@@ -107,6 +250,11 @@ static bool ExtractBspModel( const byte *pBase, int nModel, CUtlVector<float> &v
+ 	const char *pStringData = Lump<char>( pBase, pHeader, LUMP_TEXDATA_STRING_DATA, &nStringData );
+ 	if ( nModel < 0 || nModel >= nModels || nFaces < 1 )
+ 		return false;
++	int nLight = 0;
++	const ColorRGBExp32 *pLight = Lump<ColorRGBExp32>( pBase, pHeader, LUMP_LIGHTING, &nLight );
++	if ( nLight == 0 )
++		pLight = Lump<ColorRGBExp32>( pBase, pHeader, LUMP_LIGHTING_HDR, &nLight );
++	CUtlMap<int, IMaterial *> texMaterials( DefLessFunc( int ) );
+ 
+ 	const int nSkipFlags = SURF_SKY | SURF_SKY2D | SURF_NODRAW | SURF_TRIGGER | SURF_HINT | SURF_SKIP | SURF_TRANS;
+ 	const dmodel_t &world = pModels[nModel];
+@@ -124,6 +272,7 @@ static bool ExtractBspModel( const byte *pBase, int nModel, CUtlVector<float> &v
+ 			if ( ti.flags & SURF_TRANS ) nSkippedTrans++;
+ 			continue;
+ 		}
++		IMaterial *pFaceMat = NULL;
+ 		if ( ti.texdata >= 0 && ti.texdata < nTexData )
+ 		{
+ 			int nameIdx = pTexData[ti.texdata].nameStringTableID;
+@@ -132,8 +281,45 @@ static bool ExtractBspModel( const byte *pBase, int nModel, CUtlVector<float> &v
+ 				const char *pName = pStringData + pStringTable[nameIdx];
+ 				if ( !V_strnicmp( pName, "tools/", 6 ) )
+ 					continue;
++				if ( pTriMats )
++				{
++					int mi = texMaterials.Find( ti.texdata );
++					if ( mi == texMaterials.InvalidIndex() )
++					{
++						IMaterial *pM = materials->FindMaterial( pName, TEXTURE_GROUP_WORLD, false );
++						mi = texMaterials.Insert( ti.texdata, ( pM && !pM->IsErrorMaterial() ) ? pM : NULL );
++					}
++					pFaceMat = texMaterials[mi];
++				}
+ 			}
+ 		}
++		// per-triangle material: reflectivity from the material, flat colour from the face's lightmap average
++		unsigned int packed[2] = { 0, 0 };
++		if ( pTriMats )
++		{
++			float r = 0.0f, tint[3] = { 1, 1, 1 }, flat[3] = { 0.3f, 0.3f, 0.3f };
++			Vector vLight( 0.6f, 0.6f, 0.6f );
++			int nLuxels = ( face.m_LightmapTextureSizeInLuxels[0] + 1 ) * ( face.m_LightmapTextureSizeInLuxels[1] + 1 );
++			if ( face.lightofs >= 0 && nLight > 0 && nLuxels > 0 )
++			{
++				int first = face.lightofs / (int)sizeof( ColorRGBExp32 );
++				if ( first + nLuxels <= nLight )
++				{
++					Vector sum( 0, 0, 0 );
++					int step = MAX( 1, nLuxels / 64 );
++					int n = 0;
++					for ( int l = 0; l < nLuxels; l += step, n++ )
++					{
++						Vector c; ColorRGBExp32ToVector( pLight[first + l], c );
++						sum += c;
++					}
++					if ( n > 0 ) vLight = sum / ( 255.0f * n );
++				}
++			}
++			ClassifyReflective( pFaceMat, &r, tint );
++			MaterialFlatColor( pFaceMat, vLight, flat );
++			RT_PackMaterial( packed, r, rt_reflection_roughness.GetFloat(), tint, flat );
++		}
+ 
+ 		// gather the face polygon
+ 		faceVerts.RemoveAll();
+@@ -184,6 +370,7 @@ static bool ExtractBspModel( const byte *pBase, int nModel, CUtlVector<float> &v
+ 					unsigned int a = base + row * side + col, b = a + 1, cc = a + side, d = cc + 1;
+ 					indices.AddToTail( a ); indices.AddToTail( b ); indices.AddToTail( cc );
+ 					indices.AddToTail( b ); indices.AddToTail( d ); indices.AddToTail( cc );
++					if ( pTriMats ) { pTriMats->AddToTail( packed[0] ); pTriMats->AddToTail( packed[1] ); pTriMats->AddToTail( packed[0] ); pTriMats->AddToTail( packed[1] ); }
+ 				}
+ 			}
+ 			continue;
+@@ -198,6 +385,7 @@ static bool ExtractBspModel( const byte *pBase, int nModel, CUtlVector<float> &v
+ 		for ( int i = 1; i + 1 < faceVerts.Count(); i++ )
+ 		{
+ 			indices.AddToTail( base ); indices.AddToTail( base + i ); indices.AddToTail( base + i + 1 );
++			if ( pTriMats ) { pTriMats->AddToTail( packed[0] ); pTriMats->AddToTail( packed[1] ); }
+ 		}
+ 	}
+ 	return indices.Count() >= 3;
+@@ -224,6 +412,7 @@ struct RTModelTris_t
+ 	CUtlVector<unsigned int> indices;
+ 	CUtlVector<unsigned char> boneIdx;		// 4 per vertex (skinned only)
+ 	CUtlVector<float> boneWeight;			// 4 per vertex (skinned only)
++	CUtlVector<unsigned int> triMats;		// 2 per triangle
+ 	bool bSkinned;
+ 	int nMesh;								// tracer mesh, created on first dynamic use
+ 	bool bMeshTried;
+@@ -301,6 +490,13 @@ static const RTModelTris_t *GetModelTriangles( const model_t *pModel, int nSkin,
+ 			continue;
+ 		if ( batch.m_pMaterial && ( batch.m_pMaterial->IsTranslucent() || batch.m_pMaterial->IsAlphaTested() ) )
+ 			continue;
++		unsigned int packed[2] = { 0, 0 };
++		{
++			float r = 0.0f, tint[3] = { 1, 1, 1 }, flat[3];
++			ClassifyReflective( batch.m_pMaterial, &r, tint );
++			MaterialFlatColor( batch.m_pMaterial, Vector( 0.45f, 0.45f, 0.45f ), flat );
++			RT_PackMaterial( packed, r, rt_reflection_roughness.GetFloat(), tint, flat );
++		}
+ 		unsigned int base = pTris->verts.Count();
+ 		for ( int v = 0; v < batch.m_Verts.Count(); v++ )
+ 		{
+@@ -326,6 +522,7 @@ static const RTModelTris_t *GetModelTriangles( const model_t *pModel, int nSkin,
+ 			if ( a < 0 || bb < 0 || c < 0 || a >= batch.m_Verts.Count() || bb >= batch.m_Verts.Count() || c >= batch.m_Verts.Count() )
+ 				continue;
+ 			pTris->indices.AddToTail( base + a ); pTris->indices.AddToTail( base + bb ); pTris->indices.AddToTail( base + c );
++			pTris->triMats.AddToTail( packed[0] ); pTris->triMats.AddToTail( packed[1] );
+ 		}
+ 	}
+ 	delete pOut;
+@@ -333,11 +530,13 @@ static const RTModelTris_t *GetModelTriangles( const model_t *pModel, int nSkin,
+ }
+ 
+ // Appends a rigid instance of a model, transformed by modelToWorld.
+-static int AppendModelInstance( const model_t *pModel, int nSkin, int nBody, const matrix3x4_t &modelToWorld, CUtlVector<float> &verts, CUtlVector<unsigned int> &indices )
++static int AppendModelInstance( const model_t *pModel, int nSkin, int nBody, const matrix3x4_t &modelToWorld, CUtlVector<float> &verts, CUtlVector<unsigned int> &indices, CUtlVector<unsigned int> *pTriMats = NULL )
+ {
+ 	const RTModelTris_t *pTris = GetModelTriangles( pModel, nSkin, nBody );
+ 	if ( !pTris || pTris->indices.Count() < 3 )
+ 		return 0;
++	if ( pTriMats )
++		pTriMats->AddVectorToTail( pTris->triMats );
+ 	unsigned int base = verts.Count() / 3;
+ 	for ( int v = 0; v < pTris->verts.Count(); v++ )
+ 	{
+@@ -359,7 +558,7 @@ static int EnsureTracerMesh( RTModelTris_t *pTris )
+ 	if ( !pRT || pTris->indices.Count() < 3 )
+ 		return 0;
+ 	pTris->nMesh = pRT->CreateMesh( &pTris->verts[0].x, pTris->verts.Count(), pTris->indices.Base(), pTris->indices.Count() / 3,
+-		pTris->bSkinned ? pTris->boneIdx.Base() : NULL, pTris->bSkinned ? pTris->boneWeight.Base() : NULL );
++		pTris->bSkinned ? pTris->boneIdx.Base() : NULL, pTris->bSkinned ? pTris->boneWeight.Base() : NULL, pTris->triMats.Base() );
+ 	return pTris->nMesh;
+ }
+ 
+@@ -486,7 +685,7 @@ static void UpdateDynamicInstances( const CViewSetup &view )
+ 	pRT->SetInstances( s_nFrame, s_Instances.Base(), s_Instances.Count(), s_BonePool.Base(), s_BonePool.Count() );
+ }
+ 
+-static int AppendStaticProps( CUtlVector<float> &verts, CUtlVector<unsigned int> &indices, int *pnProps )
++static int AppendStaticProps( CUtlVector<float> &verts, CUtlVector<unsigned int> &indices, int *pnProps, CUtlVector<unsigned int> *pTriMats )
+ {
+ 	*pnProps = 0;
+ 	if ( !staticpropmgr )
+@@ -507,7 +706,7 @@ static int AppendStaticProps( CUtlVector<float> &verts, CUtlVector<unsigned int>
+ 			nSkin = pRenderable->GetSkin();
+ 			nBody = pRenderable->GetBody();
+ 		}
+-		int n = AppendModelInstance( pProp->GetCollisionModel(), nSkin, nBody, pProp->CollisionToWorldTransform(), verts, indices );
++		int n = AppendModelInstance( pProp->GetCollisionModel(), nSkin, nBody, pProp->CollisionToWorldTransform(), verts, indices, pTriMats );
+ 		if ( n > 0 )
+ 		{
+ 			nTris += n;
+@@ -582,21 +781,21 @@ public:
+ 		double t0 = Plat_FloatTime();
+ 		ClearModelCache();
+ 		CUtlBuffer buf;
+-		CUtlVector<float> verts; CUtlVector<unsigned int> indices;
+-		if ( !filesystem->ReadFile( engine->GetLevelName(), "GAME", buf ) || !ExtractBspModel( (const byte *)buf.Base(), 0, verts, indices ) )
++		CUtlVector<float> verts; CUtlVector<unsigned int> indices, mats;
++		if ( !filesystem->ReadFile( engine->GetLevelName(), "GAME", buf ) || !ExtractBspModel( (const byte *)buf.Base(), 0, verts, indices, &mats ) )
+ 		{
+ 			Warning( "[rt] could not extract world geometry from %s\n", engine->GetLevelName() );
+ 			return;
+ 		}
+ 		int nWorldTris = indices.Count() / 3;
+-		pRT->SetWorldGeometry( verts.Base(), verts.Count() / 3, indices.Base(), indices.Count() / 3 );
++		pRT->SetWorldGeometry( verts.Base(), verts.Count() / 3, indices.Base(), indices.Count() / 3, mats.Base() );
+ 		int nPropTris = 0, nProps = 0;
+ 		if ( rt_static_props.GetBool() )
+ 		{
+-			CUtlVector<float> pv; CUtlVector<unsigned int> pi;
+-			nPropTris = AppendStaticProps( pv, pi, &nProps );
++			CUtlVector<float> pv; CUtlVector<unsigned int> pi, pm;
++			nPropTris = AppendStaticProps( pv, pi, &nProps, &pm );
+ 			if ( nPropTris > 0 )
+-				s_nStaticPropMesh = pRT->CreateMesh( pv.Base(), pv.Count() / 3, pi.Base(), pi.Count() / 3, NULL, NULL );
++				s_nStaticPropMesh = pRT->CreateMesh( pv.Base(), pv.Count() / 3, pi.Base(), pi.Count() / 3, NULL, NULL, pm.Base() );
+ 		}
+ 		// brush entities (doors, trains, breakables): one mesh per BSP model, instanced per frame
+ 		int nBrushModels = BspModelCount( (const byte *)buf.Base() ), nBrushTris = 0;
+@@ -605,10 +804,10 @@ public:
+ 		{
+ 			s_BrushMeshes[i] = 0;
+ 			if ( i == 0 ) continue;
+-			CUtlVector<float> mv; CUtlVector<unsigned int> mi;
+-			if ( ExtractBspModel( (const byte *)buf.Base(), i, mv, mi ) )
++			CUtlVector<float> mv; CUtlVector<unsigned int> mi, mm;
++			if ( ExtractBspModel( (const byte *)buf.Base(), i, mv, mi, &mm ) )
+ 			{
+-				s_BrushMeshes[i] = pRT->CreateMesh( mv.Base(), mv.Count() / 3, mi.Base(), mi.Count() / 3, NULL, NULL );
++				s_BrushMeshes[i] = pRT->CreateMesh( mv.Base(), mv.Count() / 3, mi.Base(), mi.Count() / 3, NULL, NULL, mm.Base() );
+ 				nBrushTris += mi.Count() / 3;
+ 			}
+ 		}
+@@ -694,6 +893,9 @@ void RT_DrawComposite( const CViewSetup &view )
+ 	fp.m_nDebugMode = rt_debug.GetInt();
+ 	fp.m_bAO = rt_ao.GetInt();
+ 	fp.m_bShadows = rt_shadows.GetInt();
++	fp.m_bReflections = rt_reflections.GetInt();
++	fp.m_flReflectionStrength = clamp( rt_reflection_strength.GetFloat(), 0.0f, 1.0f );
++	sscanf( rt_sky_color.GetString(), "%f %f %f", &fp.m_skyColor[0], &fp.m_skyColor[1], &fp.m_skyColor[2] );
+ 	fp.m_nResolutionDivisor = clamp( rt_divisor.GetInt(), 1, 4 );
+ 	fp.m_nAORays = clamp( rt_ao_rays.GetInt(), 1, 8 );
+ 	fp.m_bAsync = rt_async.GetInt();
+@@ -746,6 +948,41 @@ CON_COMMAND( rt_dump_world, "Write the world triangles used for ray tracing to r
+ 	Msg( "[rt] wrote rt_world.bin: %d verts, %d triangles\n", nV, nI / 3 );
+ }
+ 
++CON_COMMAND( rt_list_reflective, "List the world materials of this map that the reflection pass treats as reflective" )
++{
++	CUtlBuffer buf;
++	if ( !filesystem->ReadFile( engine->GetLevelName(), "GAME", buf ) )
++		return;
++	const byte *pBase = (const byte *)buf.Base();
++	const dheader_t *pHeader = (const dheader_t *)pBase;
++	int nTexData, nStringTable, nStringData;
++	const dtexdata_t *pTexData = Lump<dtexdata_t>( pBase, pHeader, LUMP_TEXDATA, &nTexData );
++	const int *pStringTable = Lump<int>( pBase, pHeader, LUMP_TEXDATA_STRING_TABLE, &nStringTable );
++	const char *pStringData = Lump<char>( pBase, pHeader, LUMP_TEXDATA_STRING_DATA, &nStringData );
++	for ( int i = 0; i < nTexData; i++ )
++	{
++		int nameIdx = pTexData[i].nameStringTableID;
++		if ( nameIdx < 0 || nameIdx >= nStringTable ) continue;
++		const char *pName = pStringData + pStringTable[nameIdx];
++		IMaterial *pM = materials->FindMaterial( pName, TEXTURE_GROUP_WORLD, false );
++		float r, tint[3];
++		if ( ClassifyReflective( pM, &r, tint ) )
++		{
++			bool bMask, bAlpha = pM->GetMaterialVarFlag( MATERIAL_VAR_BASEALPHAENVMAPMASK ), bNAlpha = pM->GetMaterialVarFlag( MATERIAL_VAR_NORMALMAPALPHAENVMAPMASK );
++			pM->FindVar( "$envmapmask", &bMask, false );
++			char maskInfo[256] = "";
++			if ( bMask && pM->FindVar( "$envmapmask", &bMask, false )->IsDefined() )
++			{
++				const char *pMaskName = pM->FindVar( "$envmapmask", &bMask, false )->GetStringValue();
++				float rgba[4] = { -1, -1, -1, -1 };
++				bool ok = VTFAverage( pMaskName, rgba );
++				V_snprintf( maskInfo, sizeof( maskInfo ), " mask=%s avg=%s%.2f", pMaskName, ok ? "" : "FAILED ", ( rgba[0] + rgba[1] + rgba[2] ) / 3.0f );
++			}
++			Msg( "[rt] %-50s r %.2f tint %.2f %.2f %.2f%s%s%s (%s)\n", pName, r, tint[0], tint[1], tint[2], maskInfo, bAlpha ? " basealpha" : "", bNAlpha ? " normalalpha" : "", pM->GetShaderName() );
++		}
++	}
++}
++
+ CON_COMMAND( rt_status, "Ray tracing layer status" )
+ {
+ 	IRayTracer *pRT = GetRayTracer();
+diff --git a/public/rtmetal/iraytracer.h b/public/rtmetal/iraytracer.h
+index 9185abe..becf688 100644
+--- a/public/rtmetal/iraytracer.h
++++ b/public/rtmetal/iraytracer.h
+@@ -24,6 +24,9 @@ struct RTFrameParams
+ 	int		m_nDebugMode;				// 0 off, 1 AO buffer, 2 shadow buffer, 3 normals, 4 depth
+ 	int		m_bAO;
+ 	int		m_bShadows;
++	int		m_bReflections;
++	float	m_flReflectionStrength;		// scales the material reflectivity, 0..1
++	float	m_skyColor[3];				// colour of reflected rays that leave the level (0..1)
+ 	int		m_nResolutionDivisor;		// 1 = full, 2 = half (default)
+ 	int		m_nAORays;					// AO rays per pixel per frame
+ 	int		m_bAsync;					// trace with two frames of latency (no GPU stalls); 0 = synchronous
+@@ -43,6 +46,15 @@ struct RTInstance
+ 	float			m_vMins[3], m_vMaxs[3];	// world-space bounds (sun shadow rays are only traced toward these)
+ };
+ 
++// Per-triangle material, two words: reflectivity, roughness, tint (what the reflection is multiplied by) and a
++// flat colour used when a reflected point is off screen. All 0..255.
++inline void RT_PackMaterial( unsigned int *pOut, float flReflectivity, float flRoughness, const float *pTint, const float *pFlat )
++{
++	auto b = []( float f ) -> unsigned int { int v = (int)( f * 255.0f + 0.5f ); return (unsigned int)( v < 0 ? 0 : ( v > 255 ? 255 : v ) ); };
++	pOut[0] = b( flReflectivity ) | ( b( flRoughness ) << 8 ) | ( b( pTint[0] ) << 16 ) | ( b( pTint[1] ) << 24 );
++	pOut[1] = b( pTint[2] ) | ( b( pFlat[0] ) << 8 ) | ( b( pFlat[1] ) << 16 ) | ( b( pFlat[2] ) << 24 );
++}
++
+ // Static props: occlude AO and cast nothing new, and (unlike world brushes) do not count as
+ // "already shadowed in the lightmaps" for the sun test, since vrad shadowed with their hulls at best.
+ #define RT_INSTANCE_STATIC_PROP	1
+@@ -53,11 +65,12 @@ public:
+ 	virtual bool Init() = 0;								// any thread, once; false if Metal ray tracing unavailable
+ 	virtual bool IsAvailable() = 0;
+ 	// Replaces the static geometry (copied). Triangles in world space; indices are triples.
+-	virtual void SetWorldGeometry( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris ) = 0;
++	// pTriMaterials: 2 uint32 per triangle (RT_PackMaterial), or NULL for non-reflective.
++	virtual void SetWorldGeometry( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned int *pTriMaterials ) = 0;
+ 	virtual void ClearWorld() = 0;								// also destroys all meshes and instances
+ 	// Dynamic meshes, in model space (copied). Optional skinning data: 4 bone indices and 4 weights per vertex.
+ 	// Returns 0 on failure. Any thread.
+-	virtual int CreateMesh( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned char *pBoneIndices4, const float *pBoneWeights4 ) = 0;
++	virtual int CreateMesh( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned char *pBoneIndices4, const float *pBoneWeights4, const unsigned int *pTriMaterials ) = 0;
+ 	virtual void DestroyMesh( int nMesh ) = 0;
+ 	// Replaces this frame's dynamic instances (copied). pBonePool holds nPoolFloats floats. Any thread.
+ 	// nFrame is the value that will arrive in RTFrameParams::m_nFrame for the same frame.
+diff --git a/rtmetal/rtmetal.mm b/rtmetal/rtmetal.mm
+index 9a70408..1826507 100644
+--- a/rtmetal/rtmetal.mm
++++ b/rtmetal/rtmetal.mm
+@@ -21,10 +21,10 @@
+ // togl hooks, resolved at run time
+ typedef bool ( *GLMRT_GetBackbufferInfo_t )( int *, int *, int * );
+ typedef bool ( *GLMRT_ResolveDepth_t )( void * );
+-typedef bool ( *GLMRT_ResolveDepthAsync_t )( void *, void ** );
++typedef bool ( *GLMRT_ResolveDepthAsync_t )( void *, void **, void * );
+ typedef bool ( *GLMRT_WaitFence_t )( void *, unsigned long long );
+ typedef bool ( *GLMRT_Composite_t )( void *, int, int, int );
+-typedef bool ( *GLMRT_CompositeReprojected_t )( void *, void *, int, int, const float *, const float *, const float *, float, float, int );
++typedef bool ( *GLMRT_CompositeReprojected_t )( void *, void *, void *, int, int, const float *, const float *, const float *, float, float, int );
+ 
+ static const char *s_pKernels = R"MSL(
+ #include <metal_stdlib>
+@@ -42,8 +42,28 @@ struct Params {
+     int aoEnabled; int shadowEnabled; int fullW; int fullH;
+     int halfW; int halfH; int hasSun; int historyValid;
+     int aoRays; int staticPropInstance; int numShadowBoxes; int coherentBlocks;
++    int reflections; float reflectionStrength; int pad3; int pad4;
++    packed_float3 skyColor; float pad5;
+ };
+ 
++// per-triangle material (RT_PackMaterial)
++struct TriMat { float reflectivity; float roughness; float3 tint; float3 flat; };
++static TriMat unpackMat(uint2 m) {
++    TriMat t;
++    t.reflectivity = float(m.x & 0xFFu) / 255.0;
++    t.roughness = float((m.x >> 8) & 0xFFu) / 255.0;
++    t.tint = float3(float((m.x >> 16) & 0xFFu), float((m.x >> 24) & 0xFFu), float(m.y & 0xFFu)) / 255.0;
++    t.flat = float3(float((m.y >> 8) & 0xFFu), float((m.y >> 16) & 0xFFu), float((m.y >> 24) & 0xFFu)) / 255.0;
++    return t;
++}
++static bool lookupMat(device const ulong* instMats, uint inst, uint prim, thread TriMat& out) {
++    ulong addr = instMats[inst];
++    if (addr == 0) return false;
++    device const uint2* tbl = (device const uint2*)addr;
++    out = unpackMat(tbl[prim]);
++    return true;
++}
++
+ // does the ray from o along d (d.z > 0 assumed nothing) cross the box? slab test
+ static bool rayHitsBox(float3 o, float3 d, float3 bmin, float3 bmax) {
+     float3 inv = 1.0 / d;
+@@ -215,6 +235,90 @@ kernel void trace(constant Params& p [[buffer(0)]],
+     }
+     rawTex.write(float4(ao, sun, dist, 1.0), gid);
+     normalTex.write(float4(N, 1.0), gid);
++
++    // Reflections: find this pixel's triangle with a short primary ray, and if its material has an
++    // environment map, follow one reflected ray. The reflected point's colour comes from this
++    // frame's image when it is on screen, else from the triangle's flat colour.
++}
++
++// Reflections, as a separate pass so the AO/shadow kernel stays small. Reflection rays go out on a
++// checkerboard that alternates each frame; the other pixels keep their reprojected history
++// (alpha < 0 marks "not traced this frame").
++kernel void reflect_(constant Params& p [[buffer(0)]],
++                     instance_acceleration_structure accel [[buffer(1)]],
++                     device const ulong* instMats [[buffer(4)]],
++                     texture2d<float, access::read> depthTex [[texture(0)]],
++                     texture2d<float, access::read> normalTex [[texture(1)]],
++                     texture2d<float, access::sample> colorTex [[texture(2)]],
++                     texture2d<float, access::write> reflRawTex [[texture(3)]],
++                     uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= (uint)p.halfW || gid.y >= (uint)p.halfH) return;
++    float4 refl = float4(0.0, 0.0, 0.0, -1.0);
++    bool traceRefl = (((gid.x + gid.y + uint(p.frame)) & 1u) == 0u);
++    if (!traceRefl) { reflRawTex.write(refl, gid); return; }
++    float4 nrm = normalTex.read(gid);
++    if (nrm.a == 0.0) { reflRawTex.write(float4(0.0), gid); return; }
++    int div = p.fullW / p.halfW;
++    int2 px = int2(gid) * div + div / 2;
++    float d = readDepth(depthTex, px, p);
++    float2 uv = (float2(px) + 0.5) / float2(p.fullW, p.fullH);
++    float3 P = reconstruct(p, uv, d);
++    float3 N = nrm.xyz;
++    float3 V = normalize(float3(p.cameraPos) - P);
++    float dist = length(float3(p.cameraPos) - P);
++    float bias = 0.5 + dist * 0.002;
++    float3 origin = P + N * bias;
++    intersector<triangle_data, instancing> isect;
++    isect.set_triangle_cull_mode(triangle_cull_mode::none);
++    isect.assume_geometry_type(geometry_type::triangle);
++    uint seed = hash(gid.x * 1973u + gid.y * 9277u + uint(p.frame) * 26699u + 77u);
++    refl = float4(0.0);
++    // identify the pixel's triangle with a short probe from just above the surface back into it
++    float probe = 1.0 + dist * 0.004;
++    ray pr; pr.origin = P + N * probe; pr.direction = -N; pr.min_distance = 0.0; pr.max_distance = probe * 3.0;
++    intersection_result<triangle_data, instancing> ph = isect.intersect(pr, accel);
++    TriMat m;
++    float fres = 0.25 + 0.75 * pow(1.0 - saturate(dot(N, V)), 3.0);
++    if (ph.type != intersection_type::none && lookupMat(instMats, ph.instance_id, ph.primitive_id, m) && m.reflectivity * p.reflectionStrength * fres > 0.03) {
++        float3 R = reflect(-V, N);
++        float u1 = rnd(seed), u2 = rnd(seed);
++        float3 t = normalize(cross(abs(R.x) > 0.5 ? float3(0,1,0) : float3(1,0,0), R));
++        float3 b = cross(R, t);
++        float maxA = m.roughness * 0.6;
++        float cosA = mix(cos(maxA), 1.0, u1), sinA = sqrt(max(0.0, 1.0 - cosA * cosA)), phi = 6.28318530718 * u2;
++        float3 dir = normalize(R * cosA + t * (sinA * cos(phi)) + b * (sinA * sin(phi)));
++        if (dot(dir, N) < 0.05) dir = normalize(dir - N * (dot(dir, N) - 0.05));
++        ray rr; rr.origin = origin; rr.direction = dir; rr.min_distance = 0.0; rr.max_distance = 6144.0;
++        intersection_result<triangle_data, instancing> rh = isect.intersect(rr, accel);
++        float3 c = float3(p.skyColor);
++        if (rh.type != intersection_type::none) {
++            float3 H = origin + dir * rh.distance;
++            bool onScreen = false;
++            float4 clip = p.worldToProj * float4(H, 1.0);
++            if (clip.w > 0.0) {
++                float2 huv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
++                if (all(huv > 0.0) && all(huv < 1.0)) {
++                    int2 hp = int2(huv * float2(p.fullW, p.fullH));
++                    float hd = readDepth(depthTex, hp, p);
++                    float hdist = length(float3(p.cameraPos) - reconstruct(p, (float2(hp) + 0.5) / float2(p.fullW, p.fullH), hd));
++                    float hitDist = length(float3(p.cameraPos) - H);
++                    if (abs(hdist - hitDist) < 0.03 * hitDist + 4.0) {
++                        constexpr sampler cs(filter::linear, address::clamp_to_edge);
++                        c = colorTex.sample(cs, huv).rgb;
++                        onScreen = true;
++                    }
++                }
++            }
++            if (!onScreen) {
++                TriMat hm;
++                if (lookupMat(instMats, rh.instance_id, rh.primitive_id, hm)) c = hm.flat;
++                else c = float3(0.35);
++            }
++        }
++        refl = float4(c * m.tint, m.reflectivity * p.reflectionStrength * fres);
++    }
++    reflRawTex.write(refl, gid);
+ }
+ 
+ // temporal accumulation with reprojection; history: R ao, G sun, B dist, A sample count
+@@ -223,11 +327,16 @@ kernel void temporal(constant Params& p [[buffer(0)]],
+                      texture2d<float, access::read> depthTex [[texture(1)]],
+                      texture2d<float, access::sample> historyTex [[texture(2)]],
+                      texture2d<float, access::write> outTex [[texture(3)]],
++                     texture2d<float, access::read> reflRawTex [[texture(4)]],
++                     texture2d<float, access::sample> reflHistoryTex [[texture(5)]],
++                     texture2d<float, access::write> reflOutTex [[texture(6)]],
+                      uint2 gid [[thread_position_in_grid]])
+ {
+     if (gid.x >= (uint)p.halfW || gid.y >= (uint)p.halfH) return;
+     float4 raw = rawTex.read(gid);
+-    if (raw.a == 0.0) { outTex.write(float4(1, 1, 0, 0), gid); return; }
++    float4 reflRaw = reflRawTex.read(gid);
++    float4 reflAcc = reflRaw.a < 0.0 ? float4(0.0) : reflRaw;
++    if (raw.a == 0.0) { outTex.write(float4(1, 1, 0, 0), gid); reflOutTex.write(float4(0.0), gid); return; }
+     int div = p.fullW / p.halfW;
+     int2 px = int2(gid) * div + div / 2;
+     float d = readDepth(depthTex, px, p);
+@@ -262,11 +371,19 @@ kernel void temporal(constant Params& p [[buffer(0)]],
+                     if (any(abs(hc - h.rg) > 0.02)) count = min(count, 6.0);
+                     float w = 1.0 / (count + 1.0);
+                     acc = mix(hc, raw.rg, w);
++                    // reflections: shorter history (view dependent), same reprojection; pixels not traced
++                    // this frame keep the reprojected history
++                    float4 rh = reflHistoryTex.sample(s, puv);
++                    if (!(rh.a >= 0.0 && rh.a <= 1.0)) rh = float4(0.0);	// never accumulated (or NaN)
++                    float rw = 1.0 / (min(count, 12.0) + 1.0);
++                    reflAcc = reflRaw.a < 0.0 ? rh : mix(rh, reflRaw, rw);
+                 }
+             }
+         }
+     }
+     outTex.write(float4(acc, raw.b, count + 1.0), gid);
++    reflAcc.a = clamp(reflAcc.a, 0.0, 1.0);
++    reflOutTex.write(reflAcc, gid);
+ }
+ 
+ // depth-aware 5x5 blur on the accumulated half-res buffer
+@@ -294,6 +411,28 @@ kernel void blur(constant Params& p [[buffer(0)]],
+     outTex.write(float4(wsum > 0.0 ? sum / wsum : c.rg, c.b, c.a), gid);
+ }
+ 
++// depth-aware 3x3 blur of the accumulated reflection buffer
++kernel void blurRefl(constant Params& p [[buffer(0)]],
++                     texture2d<float, access::read> inTex [[texture(0)]],
++                     texture2d<float, access::read> aoTex [[texture(1)]],
++                     texture2d<float, access::write> outTex [[texture(2)]],
++                     uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= (uint)p.halfW || gid.y >= (uint)p.halfH) return;
++    float4 c = inTex.read(gid);
++    float4 a = aoTex.read(gid);
++    if (a.a == 0.0 || c.a == 0.0) { outTex.write(c, gid); return; }
++    float4 sum = 0.0; float wsum = 0.0;
++    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
++        int2 q = clamp(int2(gid) + int2(dx, dy), int2(0), int2(p.halfW - 1, p.halfH - 1));
++        float4 s = inTex.read(uint2(q));
++        float4 sa = aoTex.read(uint2(q));
++        if (sa.a == 0.0 || s.a == 0.0) continue;
++        float w = exp(-abs(sa.b - a.b) / (0.05 * a.b + 1.0));
++        sum += s * w; wsum += w;
++    }
++    outTex.write(wsum > 0.0 ? sum / wsum : c, gid);
++}
+ )MSL";
+ 
+ struct RTParamsGPU
+@@ -305,13 +444,15 @@ struct RTParamsGPU
+ 	int aoEnabled; int shadowEnabled; int fullW; int fullH;
+ 	int halfW; int halfH; int hasSun; int historyValid;
+ 	int aoRays; int staticPropInstance; int numShadowBoxes; int coherentBlocks;
++	int reflections; float reflectionStrength; int pad3; int pad4;
++	float skyColor[3]; float pad5;
+ };
+ 
+ // A dynamic mesh: rest-pose geometry in model space. Rigid meshes carry a prebuilt BVH;
+ // skinned meshes are skinned per instance into world space and refitted each frame.
+ struct RTMesh_t
+ {
+-	id<MTLBuffer> vb, ib, boneIdx, boneWeight;
++	id<MTLBuffer> vb, ib, boneIdx, boneWeight, mats;
+ 	int nVerts, nTris;
+ 	bool bSkinned;
+ 	id<MTLAccelerationStructure> rigidAS;
+@@ -332,15 +473,15 @@ class CRayTracerMetal : public IRayTracer
+ {
+ public:
+ 	CRayTracerMetal() : m_bInit( false ), m_bAvailable( false ), m_pDevice( nil ), m_pQueue( nil ), m_pAccel( nil ), m_pPendingAccel( nil ),
+-		m_nSlotCounter( 0 ), m_bAsync( true ), m_nFullW( 0 ), m_nFullH( 0 ), m_nHalfW( 0 ), m_nHalfH( 0 ), m_nHistoryIndex( 0 ), m_bHistoryValid( false ),
++		m_nSlotCounter( 0 ), m_bAsync( true ), m_bReflections( true ), m_nFullW( 0 ), m_nFullH( 0 ), m_nHalfW( 0 ), m_nHalfH( 0 ), m_nHistoryIndex( 0 ), m_bHistoryValid( false ),
+ 		m_pfnGetBackbufferInfo( NULL ), m_pfnResolveDepth( NULL ), m_pfnResolveDepthAsync( NULL ), m_pfnWaitFence( NULL ), m_pfnComposite( NULL ), m_pfnCompositeReprojected( NULL ), m_bDepthCaptured( false ), m_flTimeResolve( 0 ), m_flTimeMetalWall( 0 ), m_flTimeMetalGPU( 0 ), m_flTimeMetalWait( 0 ), m_flTimeComposite( 0 ), m_nTimedFrames( 0 ),
+-		m_nNextMesh( 1 ), m_nEncodeFrame( -1 ), m_pInstanceDescBuffer( nil ), m_pInstanceScratch( nil ), m_pProbe( nil ), m_pShadowBoxes( nil ), m_nShadowBoxes( 0 ), m_nShadowBoxCapacity( 0 ), m_pInstanceAS( nil ), m_nInstanceCapacity( 0 ), m_nFrameCounter( 0 ), m_nLastInstanceCount( 0 ), m_nLastSkinnedCount( 0 ), m_nStaticPropInstance( -1 ), m_flGPUAverage( 0 ), m_bReducedRays( false ), m_flTimeDynamic( 0 ), m_pSkin( nil ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; memset( m_slots, 0, sizeof( m_slots ) ); }
++		m_nNextMesh( 1 ), m_nEncodeFrame( -1 ), m_pInstanceDescBuffer( nil ), m_pInstanceScratch( nil ), m_pProbe( nil ), m_pShadowBoxes( nil ), m_pInstMats( nil ), m_pWorldMats( nil ), m_pPendingWorldMats( nil ), m_nInstMatsCapacity( 0 ), m_nShadowBoxes( 0 ), m_nShadowBoxCapacity( 0 ), m_pInstanceAS( nil ), m_nInstanceCapacity( 0 ), m_nFrameCounter( 0 ), m_nLastInstanceCount( 0 ), m_nLastSkinnedCount( 0 ), m_nStaticPropInstance( -1 ), m_flGPUAverage( 0 ), m_bReducedRays( false ), m_nReduceLevel( 0 ), m_nBudgetCooldown( 0 ), m_flTimeDynamic( 0 ), m_pSkin( nil ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; memset( m_slots, 0, sizeof( m_slots ) ); }
+ 
+ 	virtual bool Init() OVERRIDE;
+ 	virtual bool IsAvailable() OVERRIDE { return m_bAvailable; }
+-	virtual void SetWorldGeometry( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris ) OVERRIDE;
++	virtual void SetWorldGeometry( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned int *pTriMaterials ) OVERRIDE;
+ 	virtual void ClearWorld() OVERRIDE;
+-	virtual int CreateMesh( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned char *pBoneIndices4, const float *pBoneWeights4 ) OVERRIDE;
++	virtual int CreateMesh( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned char *pBoneIndices4, const float *pBoneWeights4, const unsigned int *pTriMaterials ) OVERRIDE;
+ 	virtual void DestroyMesh( int nMesh ) OVERRIDE;
+ 	virtual void SetInstances( int nFrame, const RTInstance *pInstances, int nInstances, const float *pBonePool, int nPoolFloats ) OVERRIDE;
+ 	virtual bool CaptureDepth( int nResolutionDivisor ) OVERRIDE;
+@@ -350,8 +491,8 @@ public:
+ 	// passed, without stalling) and composited at N+2, reprojected to that frame's camera.
+ 	struct FrameSlot_t
+ 	{
+-		IOSurfaceRef depthSurface, filteredSurface, normalSurface;
+-		id<MTLTexture> depthTex, filteredTex, normalTex;
++		IOSurfaceRef depthSurface, filteredSurface, normalSurface, colorSurface, reflSurface;
++		id<MTLTexture> depthTex, filteredTex, normalTex, colorTex, reflTex;
+ 		void *pFence;
+ 		bool bDepthReady;		// GL resolve issued, fence pending or passed
+ 		bool bTraced;			// command buffer committed
+@@ -372,7 +513,7 @@ private:
+ 	id<MTLAccelerationStructure> BuildPrimitiveAS( MTLPrimitiveAccelerationStructureDescriptor *desc, MTLAccelerationStructureSizes *pSizes );
+ 	MTLPrimitiveAccelerationStructureDescriptor *MeshDescriptor( const RTMesh_t &mesh, id<MTLBuffer> vb );
+ 	void DestroySkinnedInstance( RTSkinnedInstance_t &inst );
+-	bool EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArray *pKeepAlive, id<MTLAccelerationStructure> *ppInstanceAS, NSArray **ppPrimitiveASes, int *pnInstances );
++	bool EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArray *pKeepAlive, id<MTLAccelerationStructure> *ppInstanceAS, NSArray **ppPrimitiveASes, int *pnInstances, NSMutableArray *pMatBuffers );
+ 
+ 	// dynamic scene (mutex-protected: client thread writes, render thread reads)
+ 	std::mutex m_meshMutex;
+@@ -384,26 +525,27 @@ private:
+ 	std::vector<float> m_frameBones;
+ 	int m_nEncodeFrame;									// frame whose instances EncodeDynamicScene should use
+ 	std::map<unsigned int, RTSkinnedInstance_t> m_skinned;
+-	id<MTLBuffer> m_pInstanceDescBuffer, m_pInstanceScratch, m_pProbe, m_pShadowBoxes;
++	id<MTLBuffer> m_pInstanceDescBuffer, m_pInstanceScratch, m_pProbe, m_pShadowBoxes, m_pInstMats, m_pWorldMats, m_pPendingWorldMats;
++	int m_nInstMatsCapacity;
+ 	int m_nShadowBoxes, m_nShadowBoxCapacity;
+ 	id<MTLAccelerationStructure> m_pInstanceAS;
+ 	int m_nInstanceCapacity;
+ 	int m_nFrameCounter, m_nLastInstanceCount, m_nLastSkinnedCount, m_nStaticPropInstance;
+-	double m_flGPUAverage; bool m_bReducedRays;
++	double m_flGPUAverage; bool m_bReducedRays; int m_nReduceLevel, m_nBudgetCooldown;
+ 	double m_flTimeDynamic;
+ 	id<MTLComputePipelineState> m_pSkin;
+ 
+ 	bool m_bInit, m_bAvailable;
+ 	id<MTLDevice> m_pDevice;
+ 	id<MTLCommandQueue> m_pQueue;
+-	id<MTLComputePipelineState> m_pTrace, m_pTemporal, m_pBlur;
++	id<MTLComputePipelineState> m_pTrace, m_pReflect, m_pTemporal, m_pBlur, m_pBlurRefl;
+ 	std::mutex m_accelMutex;
+ 	id<MTLAccelerationStructure> m_pAccel, m_pPendingAccel;
+ 	id<MTLBuffer> m_pVertexBuffer, m_pIndexBuffer;	// keep alive while the structure references them
+ 	FrameSlot_t m_slots[3];
+ 	int m_nSlotCounter;			// increments per CaptureDepth
+-	bool m_bAsync;
+-	id<MTLTexture> m_pRawTex, m_pHistory[2];
++	bool m_bAsync, m_bReflections;
++	id<MTLTexture> m_pRawTex, m_pHistory[2], m_pReflRawTex, m_pReflHistory[2];
+ 	int m_nFullW, m_nFullH, m_nHalfW, m_nHalfH, m_nHistoryIndex;
+ 	bool m_bHistoryValid;
+ 	float m_prevWorldToProj[16];
+@@ -437,7 +579,7 @@ bool CRayTracerMetal::Init()
+ 		id<MTLLibrary> lib = [m_pDevice newLibraryWithSource:[NSString stringWithUTF8String:s_pKernels] options:nil error:&err];
+ 		if ( !lib ) { SetStatus( "kernel compile failed: %s", [[err localizedDescription] UTF8String] ); return false; }
+ 		struct { const char *name; id<MTLComputePipelineState> *out; } kernels[] = {
+-			{ "trace", &m_pTrace }, { "temporal", &m_pTemporal }, { "blur", &m_pBlur }, { "skin", &m_pSkin } };
++			{ "trace", &m_pTrace }, { "reflect_", &m_pReflect }, { "temporal", &m_pTemporal }, { "blur", &m_pBlur }, { "blurRefl", &m_pBlurRefl }, { "skin", &m_pSkin } };
+ 		for ( auto &k : kernels )
+ 		{
+ 			id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:k.name]];
+@@ -459,7 +601,7 @@ bool CRayTracerMetal::Init()
+ 	return true;
+ }
+ 
+-void CRayTracerMetal::SetWorldGeometry( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris )
++void CRayTracerMetal::SetWorldGeometry( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned int *pTriMaterials )
+ {
+ 	if ( !m_bAvailable || nTris <= 0 || nVerts <= 0 )
+ 		return;
+@@ -479,10 +621,13 @@ void CRayTracerMetal::SetWorldGeometry( const float *pVertsXYZ, int nVerts, cons
+ 		desc.geometryDescriptors = @[ geom ];
+ 		MTLAccelerationStructureSizes sizes;
+ 		id<MTLAccelerationStructure> accel = BuildPrimitiveAS( desc, &sizes );
++		id<MTLBuffer> mats = pTriMaterials ? [m_pDevice newBufferWithBytes:pTriMaterials length:(size_t)nTris * 2 * sizeof( unsigned int ) options:MTLResourceStorageModeShared] : nil;
+ 		{
+ 			std::lock_guard<std::mutex> lock( m_accelMutex );
+ 			if ( m_pPendingAccel ) [m_pPendingAccel release];
+ 			m_pPendingAccel = [accel retain];
++			[m_pPendingWorldMats release];
++			m_pPendingWorldMats = mats;
+ 			// buffers are swapped in on the render thread together with the structure
+ 			[m_pVertexBuffer release]; [m_pIndexBuffer release];
+ 			m_pVertexBuffer = [vb retain]; m_pIndexBuffer = [ib retain];
+@@ -498,13 +643,15 @@ void CRayTracerMetal::ClearWorld()
+ 		std::lock_guard<std::mutex> lock( m_accelMutex );
+ 		if ( m_pAccel ) { [m_pAccel release]; m_pAccel = nil; }
+ 		if ( m_pPendingAccel ) { [m_pPendingAccel release]; m_pPendingAccel = nil; }
++		[m_pWorldMats release]; m_pWorldMats = nil;
++		[m_pPendingWorldMats release]; m_pPendingWorldMats = nil;
+ 		m_bHistoryValid = false;
+ 	}
+ 	std::lock_guard<std::mutex> lock( m_meshMutex );
+ 	for ( auto &kv : m_meshes )
+ 	{
+ 		RTMesh_t &m = kv.second;
+-		[m.vb release]; [m.ib release]; [m.boneIdx release]; [m.boneWeight release]; [m.rigidAS release];
++		[m.vb release]; [m.ib release]; [m.boneIdx release]; [m.boneWeight release]; [m.rigidAS release]; [m.mats release];
+ 	}
+ 	m_meshes.clear();
+ 	for ( auto &kv : m_skinned )
+@@ -546,7 +693,7 @@ MTLPrimitiveAccelerationStructureDescriptor *CRayTracerMetal::MeshDescriptor( co
+ 	return desc;
+ }
+ 
+-int CRayTracerMetal::CreateMesh( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned char *pBoneIndices4, const float *pBoneWeights4 )
++int CRayTracerMetal::CreateMesh( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned char *pBoneIndices4, const float *pBoneWeights4, const unsigned int *pTriMaterials )
+ {
+ 	if ( !m_bAvailable || nTris <= 0 || nVerts <= 0 )
+ 		return 0;
+@@ -559,6 +706,7 @@ int CRayTracerMetal::CreateMesh( const float *pVertsXYZ, int nVerts, const unsig
+ 		mesh.vb = [m_pDevice newBufferWithBytes:padded.data() length:padded.size() * sizeof( float ) options:MTLResourceStorageModeShared];
+ 		mesh.ib = [m_pDevice newBufferWithBytes:pIndices length:(size_t)nTris * 3 * sizeof( unsigned int ) options:MTLResourceStorageModeShared];
+ 		mesh.nVerts = nVerts; mesh.nTris = nTris;
++		mesh.mats = pTriMaterials ? [m_pDevice newBufferWithBytes:pTriMaterials length:(size_t)nTris * 2 * sizeof( unsigned int ) options:MTLResourceStorageModeShared] : nil;
+ 		mesh.bSkinned = pBoneIndices4 && pBoneWeights4;
+ 		if ( mesh.bSkinned )
+ 		{
+@@ -591,7 +739,7 @@ void CRayTracerMetal::DestroyMesh( int nMesh )
+ 	if ( it == m_meshes.end() )
+ 		return;
+ 	RTMesh_t &m = it->second;
+-	[m.vb release]; [m.ib release]; [m.boneIdx release]; [m.boneWeight release]; [m.rigidAS release];
++	[m.vb release]; [m.ib release]; [m.boneIdx release]; [m.boneWeight release]; [m.rigidAS release]; [m.mats release];
+ 	m_meshes.erase( it );
+ 	for ( auto sk = m_skinned.begin(); sk != m_skinned.end(); )
+ 	{
+@@ -623,7 +771,7 @@ static inline void PackTransform( const float *m /* row-major 3x4 */, MTLPackedF
+ 
+ // Encodes skinning, BVH builds/refits and the instance structure for this frame's dynamic
+ // objects plus the static world. Called on the render thread with m_pAccel valid.
+-bool CRayTracerMetal::EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArray *pKeepAlive, id<MTLAccelerationStructure> *ppInstanceAS, NSArray **ppPrimitiveASes, int *pnInstances )
++bool CRayTracerMetal::EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArray *pKeepAlive, id<MTLAccelerationStructure> *ppInstanceAS, NSArray **ppPrimitiveASes, int *pnInstances, NSMutableArray *pMatBuffers )
+ {
+ 	std::lock_guard<std::mutex> lock( m_meshMutex );
+ 	{
+@@ -652,6 +800,9 @@ bool CRayTracerMetal::EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArra
+ 	d.mask = 1;		// world brushes; static props 4, dynamic objects 2 (sun shadows come from dynamic objects only)
+ 	d.accelerationStructureIndex = 0;
+ 	descs.push_back( d );
++	std::vector<unsigned long long> matAddrs;	// per instance: GPU address of its per-triangle material table, 0 if none
++	matAddrs.push_back( m_pWorldMats ? [m_pWorldMats gpuAddress] : 0 );
++	if ( m_pWorldMats ) [pMatBuffers addObject:m_pWorldMats];
+ 
+ 	id<MTLComputeCommandEncoder> ce = nil;
+ 	id<MTLAccelerationStructureCommandEncoder> ae = nil;
+@@ -684,6 +835,8 @@ bool CRayTracerMetal::EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArra
+ 			d.mask = ( inst.m_nFlags & RT_INSTANCE_STATIC_PROP ) ? 4 : 2;
+ 			if ( inst.m_nFlags & RT_INSTANCE_STATIC_PROP ) nStaticPropInstance = (int)descs.size();
+ 			descs.push_back( d );
++			matAddrs.push_back( mesh.mats ? [mesh.mats gpuAddress] : 0 );
++			if ( mesh.mats ) [pMatBuffers addObject:mesh.mats];
+ 			continue;
+ 		}
+ 		if ( (size_t)( inst.m_nBoneOffset + inst.m_nBones * 12 ) > m_frameBones.size() )
+@@ -726,6 +879,8 @@ bool CRayTracerMetal::EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArra
+ 		d.accelerationStructureIndex = idx;
+ 		d.mask = 2;
+ 		descs.push_back( d );
++		matAddrs.push_back( mesh.mats ? [mesh.mats gpuAddress] : 0 );
++		if ( mesh.mats ) [pMatBuffers addObject:mesh.mats];
+ 	}
+ 	if ( ce )
+ 		[ce endEncoding];
+@@ -785,6 +940,14 @@ bool CRayTracerMetal::EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArra
+ 
+ 	m_nLastInstanceCount = nInst - 1;	// includes the static prop instance
+ 	m_nStaticPropInstance = nStaticPropInstance;
++	if ( (int)matAddrs.size() > m_nInstMatsCapacity || !m_pInstMats )
++	{
++		int cap = (int)matAddrs.size() < 256 ? 256 : (int)matAddrs.size() * 2;
++		[m_pInstMats release];
++		m_pInstMats = [m_pDevice newBufferWithLength:(size_t)cap * sizeof( unsigned long long ) options:MTLResourceStorageModeShared];
++		m_nInstMatsCapacity = cap;
++	}
++	memcpy( [m_pInstMats contents], matAddrs.data(), matAddrs.size() * sizeof( unsigned long long ) );
+ 	m_nShadowBoxes = (int)boxes.size() / 6;
+ 	if ( m_nShadowBoxes > m_nShadowBoxCapacity || !m_pShadowBoxes )
+ 	{
+@@ -822,10 +985,12 @@ void CRayTracerMetal::ReleaseSlots()
+ 		FrameSlot_t &sl = m_slots[i];
+ 		if ( sl.cb ) { [sl.cb waitUntilCompleted]; [sl.cb release]; }
+ 		if ( sl.pFence ) m_pfnWaitFence( sl.pFence, 1000000000ull );
+-		[sl.depthTex release]; [sl.filteredTex release]; [sl.normalTex release];
++		[sl.depthTex release]; [sl.filteredTex release]; [sl.normalTex release]; [sl.colorTex release]; [sl.reflTex release];
+ 		if ( sl.depthSurface ) CFRelease( sl.depthSurface );
+ 		if ( sl.filteredSurface ) CFRelease( sl.filteredSurface );
+ 		if ( sl.normalSurface ) CFRelease( sl.normalSurface );
++		if ( sl.colorSurface ) CFRelease( sl.colorSurface );
++		if ( sl.reflSurface ) CFRelease( sl.reflSurface );
+ 		memset( &sl, 0, sizeof( sl ) );
+ 	}
+ }
+@@ -839,6 +1004,7 @@ bool CRayTracerMetal::EnsureTargets( int w, int h, int divisor )
+ 	{
+ 		ReleaseSlots();
+ 		[m_pRawTex release]; [m_pHistory[0] release]; [m_pHistory[1] release];
++		[m_pReflRawTex release]; [m_pReflHistory[0] release]; [m_pReflHistory[1] release];
+ 		NSDictionary *depthProps = @{ (id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfacePixelFormat: @(0x42475241) };
+ 		NSDictionary *halfProps = @{ (id)kIOSurfaceWidth: @(hw), (id)kIOSurfaceHeight: @(hh), (id)kIOSurfaceBytesPerElement: @8, (id)kIOSurfacePixelFormat: @(0x52476841) };	// RGhA: RGBA half
+ 		for ( int i = 0; i < 3; i++ )
+@@ -847,12 +1013,19 @@ bool CRayTracerMetal::EnsureTargets( int w, int h, int divisor )
+ 			sl.depthSurface = IOSurfaceCreate( (CFDictionaryRef)depthProps );
+ 			sl.filteredSurface = IOSurfaceCreate( (CFDictionaryRef)halfProps );
+ 			sl.normalSurface = IOSurfaceCreate( (CFDictionaryRef)halfProps );
+-			if ( !sl.depthSurface || !sl.filteredSurface || !sl.normalSurface ) { SetStatus( "IOSurface creation failed" ); return false; }
++			sl.colorSurface = IOSurfaceCreate( (CFDictionaryRef)depthProps );
++			sl.reflSurface = IOSurfaceCreate( (CFDictionaryRef)halfProps );
++			if ( !sl.depthSurface || !sl.filteredSurface || !sl.normalSurface || !sl.colorSurface || !sl.reflSurface ) { SetStatus( "IOSurface creation failed" ); return false; }
+ 			sl.depthTex = MakeTex( m_pDevice, MTLPixelFormatBGRA8Unorm, w, h, sl.depthSurface );
+ 			sl.filteredTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, sl.filteredSurface );
+ 			sl.normalTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, sl.normalSurface );
++			sl.colorTex = MakeTex( m_pDevice, MTLPixelFormatBGRA8Unorm, w, h, sl.colorSurface );
++			sl.reflTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, sl.reflSurface );
+ 		}
+ 		m_pRawTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
++		m_pReflRawTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
++		m_pReflHistory[0] = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
++		m_pReflHistory[1] = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
+ 		m_pHistory[0] = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
+ 		m_pHistory[1] = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
+ 		m_nFullW = w; m_nFullH = h; m_nHalfW = hw; m_nHalfH = hh;
+@@ -886,9 +1059,9 @@ bool CRayTracerMetal::CaptureDepth( int nResolutionDivisor )
+ 	sl.bTraced = false;
+ 	double t0 = CFAbsoluteTimeGetCurrent();
+ 	if ( m_bAsync )
+-		sl.bDepthReady = m_pfnResolveDepthAsync( sl.depthSurface, &sl.pFence );
++		sl.bDepthReady = m_pfnResolveDepthAsync( sl.depthSurface, &sl.pFence, m_bReflections ? sl.colorSurface : NULL );
+ 	else
+-		sl.bDepthReady = m_pfnResolveDepth( sl.depthSurface );
++		sl.bDepthReady = m_pfnResolveDepthAsync( sl.depthSurface, NULL, m_bReflections ? sl.colorSurface : NULL );
+ 	m_flTimeResolve += ( CFAbsoluteTimeGetCurrent() - t0 ) * 1000.0;
+ 	if ( sl.bDepthReady )
+ 		m_nSlotCounter++;
+@@ -915,6 +1088,9 @@ bool CRayTracerMetal::TraceSlot( FrameSlot_t &slot, bool bWaitForDepth )
+ 			[m_pAccel release];
+ 			m_pAccel = m_pPendingAccel;
+ 			m_pPendingAccel = nil;
++			[m_pWorldMats release];
++			m_pWorldMats = m_pPendingWorldMats;
++			m_pPendingWorldMats = nil;
+ 			m_bHistoryValid = false;
+ 		}
+ 	}
+@@ -941,15 +1117,22 @@ bool CRayTracerMetal::TraceSlot( FrameSlot_t &slot, bool bWaitForDepth )
+ 		gp.hasSun = sunLen > 0.5f;
+ 		gp.historyValid = m_bHistoryValid;
+ 		gp.aoRays = params.m_nAORays > 0 ? params.m_nAORays : 1;
+-		// budget controller: drop to one AO ray per pixel while the tracer runs over its GPU budget
++		// budget controller: while the tracer runs over its GPU budget, first drop to one AO ray per
++		// pixel, then drop reflections; re-enable in the reverse order once well under budget.
++		// Decisions are spaced out so the average can settle.
+ 		if ( params.m_flBudgetMs > 0.0f && m_flGPUAverage > 0.0 )
+ 		{
+-			if ( m_flGPUAverage > params.m_flBudgetMs ) m_bReducedRays = true;
+-			else if ( m_flGPUAverage < params.m_flBudgetMs * 0.45 ) m_bReducedRays = false;
++			if ( ++m_nBudgetCooldown >= 30 )
++			{
++				if ( m_flGPUAverage > params.m_flBudgetMs && m_nReduceLevel < 2 ) { m_nReduceLevel++; m_nBudgetCooldown = 0; }
++				else if ( m_flGPUAverage * 1.5 < params.m_flBudgetMs && m_nReduceLevel > 0 ) { m_nReduceLevel--; m_nBudgetCooldown = 0; }	// the next level up costs roughly half as much again
++			}
+ 		}
+ 		else
+-			m_bReducedRays = false;
++			m_nReduceLevel = 0;
++		m_bReducedRays = m_nReduceLevel >= 1;
+ 		if ( m_bReducedRays && gp.aoRays > 1 ) gp.aoRays = 1;
++		if ( m_nReduceLevel >= 2 ) gp.reflections = 0;
+ 
+ 		double t0 = CFAbsoluteTimeGetCurrent();
+ 		id<MTLTexture> histIn = m_pHistory[m_nHistoryIndex], histOut = m_pHistory[m_nHistoryIndex ^ 1];
+@@ -957,14 +1140,18 @@ bool CRayTracerMetal::TraceSlot( FrameSlot_t &slot, bool bWaitForDepth )
+ 
+ 		id<MTLAccelerationStructure> instanceAS = nil; NSArray *prims = nil; int nInst = 0;
+ 		NSMutableArray *keepAlive = [NSMutableArray array];
++		NSMutableArray *matBuffers = [NSMutableArray array];
+ 		double tDyn = CFAbsoluteTimeGetCurrent();
+ 		m_nEncodeFrame = params.m_nFrame;
+-		if ( !EncodeDynamicScene( cb, keepAlive, &instanceAS, &prims, &nInst ) )
++		if ( !EncodeDynamicScene( cb, keepAlive, &instanceAS, &prims, &nInst, matBuffers ) )
+ 			return false;
+ 		m_flTimeDynamic += ( CFAbsoluteTimeGetCurrent() - tDyn ) * 1000.0;
+ 		gp.staticPropInstance = m_nStaticPropInstance;
+ 		gp.numShadowBoxes = m_nShadowBoxes;
+ 		gp.coherentBlocks = params.m_bCoherent;
++		gp.reflections = params.m_bReflections && m_nReduceLevel < 2;
++		gp.reflectionStrength = params.m_flReflectionStrength;
++		memcpy( gp.skyColor, params.m_skyColor, sizeof( gp.skyColor ) );
+ 
+ 		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+ 		MTLSize tg = MTLSizeMake( 8, 8, 1 );
+@@ -976,20 +1163,43 @@ bool CRayTracerMetal::TraceSlot( FrameSlot_t &slot, bool bWaitForDepth )
+ 		if ( !m_pProbe ) m_pProbe = [m_pDevice newBufferWithLength:64 options:MTLResourceStorageModeShared];
+ 		[ce setBuffer:m_pProbe offset:0 atIndex:2];
+ 		[ce setBuffer:m_pShadowBoxes offset:0 atIndex:3];
++		[ce setBuffer:m_pInstMats offset:0 atIndex:4];
+ 		for ( id<MTLAccelerationStructure> prim in prims )
+ 			[ce useResource:prim usage:MTLResourceUsageRead];
++		for ( id<MTLBuffer> mb in matBuffers )
++			[ce useResource:mb usage:MTLResourceUsageRead];
++		id<MTLTexture> reflHistIn = m_pReflHistory[m_nHistoryIndex], reflHistOut = m_pReflHistory[m_nHistoryIndex ^ 1];
+ 		[ce setTexture:slot.depthTex atIndex:0]; [ce setTexture:m_pRawTex atIndex:1]; [ce setTexture:slot.normalTex atIndex:2];
+ 		[ce dispatchThreads:halfGrid threadsPerThreadgroup:tg];
+ 
++		if ( gp.reflections )
++		{
++			[ce setComputePipelineState:m_pReflect];
++			[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
++			[ce setAccelerationStructure:instanceAS atBufferIndex:1];
++			[ce setBuffer:m_pInstMats offset:0 atIndex:4];
++			[ce setTexture:slot.depthTex atIndex:0]; [ce setTexture:slot.normalTex atIndex:1]; [ce setTexture:slot.colorTex atIndex:2]; [ce setTexture:m_pReflRawTex atIndex:3];
++			[ce dispatchThreads:halfGrid threadsPerThreadgroup:tg];
++		}
++
+ 		[ce setComputePipelineState:m_pTemporal];
+ 		[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
+ 		[ce setTexture:m_pRawTex atIndex:0]; [ce setTexture:slot.depthTex atIndex:1]; [ce setTexture:histIn atIndex:2]; [ce setTexture:histOut atIndex:3];
++		[ce setTexture:m_pReflRawTex atIndex:4]; [ce setTexture:reflHistIn atIndex:5]; [ce setTexture:reflHistOut atIndex:6];
+ 		[ce dispatchThreads:halfGrid threadsPerThreadgroup:tg];
+ 
+ 		[ce setComputePipelineState:m_pBlur];
+ 		[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
+ 		[ce setTexture:histOut atIndex:0]; [ce setTexture:slot.normalTex atIndex:1]; [ce setTexture:slot.filteredTex atIndex:2];
+ 		[ce dispatchThreads:halfGrid threadsPerThreadgroup:tg];
++
++		if ( gp.reflections )
++		{
++			[ce setComputePipelineState:m_pBlurRefl];
++			[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
++			[ce setTexture:reflHistOut atIndex:0]; [ce setTexture:histOut atIndex:1]; [ce setTexture:slot.reflTex atIndex:2];
++			[ce dispatchThreads:halfGrid threadsPerThreadgroup:tg];
++		}
+ 		[ce endEncoding];
+ 		[cb commit];
+ 		slot.cb = [cb retain];
+@@ -1047,6 +1257,7 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 		return false;
+ 	m_bDepthCaptured = false;
+ 	m_bAsync = params.m_bAsync != 0;
++	m_bReflections = params.m_bReflections != 0;
+ 	// the slot captured this frame gets this frame's camera
+ 	FrameSlot_t &cur = m_slots[m_nSlotCounter % 3];
+ 	cur.params = params;
+@@ -1076,7 +1287,7 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 	double t1 = CFAbsoluteTimeGetCurrent();
+ 	if ( pComposite )
+ 	{
+-		bOK = m_pfnCompositeReprojected( pComposite->filteredSurface, pComposite->normalSurface, m_nHalfW, m_nHalfH,
++		bOK = m_pfnCompositeReprojected( pComposite->filteredSurface, pComposite->normalSurface, pComposite->params.m_bReflections ? pComposite->reflSurface : NULL, m_nHalfW, m_nHalfH,
+ 			params.m_projectionToWorld, pComposite->params.m_worldToProjection, params.m_cameraPos,
+ 			params.m_flAOStrength, params.m_flShadowStrength, params.m_nDebugMode );
+ 	}
+@@ -1084,7 +1295,7 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 	if ( ++m_nTimedFrames >= 120 )
+ 	{
+ 		snprintf( m_szTiming, sizeof( m_szTiming ), "per frame: depth resolve %.2f ms, metal encode %.2f ms (%.2f ms GPU, %.2f ms waited, %.2f ms dynamic), composite %.2f ms; trace %dx%d %s%s; %d instances (%d skinned)",
+-			m_flTimeResolve / m_nTimedFrames, m_flTimeMetalWall / m_nTimedFrames, m_flTimeMetalGPU / m_nTimedFrames, m_flTimeMetalWait / m_nTimedFrames, m_flTimeDynamic / m_nTimedFrames, m_flTimeComposite / m_nTimedFrames, m_nHalfW, m_nHalfH, m_bAsync ? "async" : "sync", m_bReducedRays ? ", over budget: 1 AO ray" : "", m_nLastInstanceCount, m_nLastSkinnedCount );
++			m_flTimeResolve / m_nTimedFrames, m_flTimeMetalWall / m_nTimedFrames, m_flTimeMetalGPU / m_nTimedFrames, m_flTimeMetalWait / m_nTimedFrames, m_flTimeDynamic / m_nTimedFrames, m_flTimeComposite / m_nTimedFrames, m_nHalfW, m_nHalfH, m_bAsync ? "async" : "sync", m_nReduceLevel >= 2 ? ", over budget: 1 AO ray, no reflections" : ( m_bReducedRays ? ", over budget: 1 AO ray" : "" ), m_nLastInstanceCount, m_nLastSkinnedCount );
+ 		m_flTimeResolve = m_flTimeMetalWall = m_flTimeMetalGPU = m_flTimeMetalWait = m_flTimeComposite = m_flTimeDynamic = 0.0; m_nTimedFrames = 0;
+ 	}
+ 	return bOK;
+diff --git a/togl/linuxwin/glmrt.cpp b/togl/linuxwin/glmrt.cpp
+index 5a429af..eddd312 100644
+--- a/togl/linuxwin/glmrt.cpp
++++ b/togl/linuxwin/glmrt.cpp
+@@ -26,10 +26,10 @@ class CGLMRayTraceHooks
+ {
+ public:
+ 	static bool GetBackbufferInfo( int *pWidth, int *pHeight, int *pMSAA );
+-	static bool ResolveDepth( IOSurfaceRef depthSurface, void **ppFence );
++	static bool ResolveDepth( IOSurfaceRef depthSurface, void **ppFence, IOSurfaceRef colorSurface = NULL );
+ 	static bool WaitFence( void *pFence, unsigned long long nTimeoutNs );
+ 	static bool Composite( IOSurfaceRef resultSurface, int nResultWidth, int nResultHeight, bool bReplace );
+-	static bool CompositeReprojected( IOSurfaceRef filteredSurface, IOSurfaceRef normalSurface, int nHalfW, int nHalfH, const float *pProjToWorld, const float *pWorldToProjPrev, const float *pCameraPos, float flAOStrength, float flShadowStrength, int nDebugMode );
++	static bool CompositeReprojected( IOSurfaceRef filteredSurface, IOSurfaceRef normalSurface, IOSurfaceRef reflSurface, int nHalfW, int nHalfH, const float *pProjToWorld, const float *pWorldToProjPrev, const float *pCameraPos, float flAOStrength, float flShadowStrength, int nDebugMode );
+ 
+ private:
+ 	static bool GetDrawingFBO( CGLMFBO **ppFBO, CGLMTex **ppDepthTex );
+@@ -47,23 +47,27 @@ private:
+ 	// resolve resources
+ 	static GLuint s_depthResolveFBO, s_depthResolveTex; static int s_depthResolveW, s_depthResolveH; static GLenum s_depthResolveIntFormat;
+ 	static GLuint s_depthPackFBO, s_depthPackTexName; static IOSurfaceRef s_depthPackSurface; static int s_depthPackW, s_depthPackH;
++	static GLuint s_colorFBO, s_colorTexName[3]; static IOSurfaceRef s_colorSurface[3]; static int s_colorW[3], s_colorH[3];
+ 	static GLuint s_packProgram, s_packProgramRect;
+ 	// composite resources
+ 	static GLuint s_resultTexName; static IOSurfaceRef s_resultSurface; static int s_resultW, s_resultH;
+ 	static GLuint s_reprojectProgram;
+ 	static GLuint s_filteredTexName[3]; static IOSurfaceRef s_filteredSurface[3]; static int s_filteredW[3], s_filteredH[3];
+ 	static GLuint s_normalTexName[3]; static IOSurfaceRef s_normalSurface[3]; static int s_normalW[3], s_normalH[3];
++	static GLuint s_reflTexName[3]; static IOSurfaceRef s_reflSurface[3]; static int s_reflW[3], s_reflH[3];
+ 	static GLuint s_compositeProgram;
+ 	static bool s_bFailed;
+ };
+ 
+ GLuint CGLMRayTraceHooks::s_depthResolveFBO = 0; GLuint CGLMRayTraceHooks::s_depthResolveTex = 0; int CGLMRayTraceHooks::s_depthResolveW = 0; int CGLMRayTraceHooks::s_depthResolveH = 0; GLenum CGLMRayTraceHooks::s_depthResolveIntFormat = 0;
+ GLuint CGLMRayTraceHooks::s_depthPackFBO = 0; GLuint CGLMRayTraceHooks::s_depthPackTexName = 0; IOSurfaceRef CGLMRayTraceHooks::s_depthPackSurface = NULL; int CGLMRayTraceHooks::s_depthPackW = 0; int CGLMRayTraceHooks::s_depthPackH = 0;
++GLuint CGLMRayTraceHooks::s_colorFBO = 0; GLuint CGLMRayTraceHooks::s_colorTexName[3] = { 0, 0, 0 }; IOSurfaceRef CGLMRayTraceHooks::s_colorSurface[3] = { NULL, NULL, NULL }; int CGLMRayTraceHooks::s_colorW[3] = { 0, 0, 0 }, CGLMRayTraceHooks::s_colorH[3] = { 0, 0, 0 };
+ GLuint CGLMRayTraceHooks::s_packProgram = 0; GLuint CGLMRayTraceHooks::s_packProgramRect = 0;
+ GLuint CGLMRayTraceHooks::s_resultTexName = 0; IOSurfaceRef CGLMRayTraceHooks::s_resultSurface = NULL; int CGLMRayTraceHooks::s_resultW = 0; int CGLMRayTraceHooks::s_resultH = 0;
+ GLuint CGLMRayTraceHooks::s_reprojectProgram = 0;
+ GLuint CGLMRayTraceHooks::s_filteredTexName[3] = { 0, 0, 0 }; IOSurfaceRef CGLMRayTraceHooks::s_filteredSurface[3] = { NULL, NULL, NULL }; int CGLMRayTraceHooks::s_filteredW[3] = { 0, 0, 0 }, CGLMRayTraceHooks::s_filteredH[3] = { 0, 0, 0 };
+ GLuint CGLMRayTraceHooks::s_normalTexName[3] = { 0, 0, 0 }; IOSurfaceRef CGLMRayTraceHooks::s_normalSurface[3] = { NULL, NULL, NULL }; int CGLMRayTraceHooks::s_normalW[3] = { 0, 0, 0 }, CGLMRayTraceHooks::s_normalH[3] = { 0, 0, 0 };
++GLuint CGLMRayTraceHooks::s_reflTexName[3] = { 0, 0, 0 }; IOSurfaceRef CGLMRayTraceHooks::s_reflSurface[3] = { NULL, NULL, NULL }; int CGLMRayTraceHooks::s_reflW[3] = { 0, 0, 0 }, CGLMRayTraceHooks::s_reflH[3] = { 0, 0, 0 };
+ GLuint CGLMRayTraceHooks::s_compositeProgram = 0;
+ bool CGLMRayTraceHooks::s_bFailed = false;
+ 
+@@ -106,6 +110,9 @@ static const char *s_pReprojectFragmentShader =
+ 	"uniform sampler2D depthTex;\n"
+ 	"uniform sampler2DRect filteredTex;\n"
+ 	"uniform sampler2DRect normalTex;\n"
++	"uniform sampler2DRect reflTex;\n"
++	"uniform int hasRefl;\n"
++	"uniform int pass;\n"      // 0: multiply (ao, sun, reflection dimming); 1: add (reflection colour)
+ 	"uniform mat4 projToWorld;\n"
+ 	"uniform mat4 worldToProjPrev;\n"
+ 	"uniform vec3 cameraPos;\n"
+@@ -115,20 +122,21 @@ static const char *s_pReprojectFragmentShader =
+ 	"uniform int debugMode;\n"
+ 	"void main() {\n"
+ 	"  float d = texture2D( depthTex, uv ).r;\n"
+-	"  if ( d >= 0.99999 ) { gl_FragColor = debugMode != 0 ? vec4( 0.0, 0.0, 0.0, 1.0 ) : vec4( 1.0 ); return; }\n"
++	"  if ( d >= 0.99999 ) { gl_FragColor = ( debugMode != 0 || pass == 1 ) ? vec4( 0.0, 0.0, 0.0, 1.0 ) : vec4( 1.0 ); return; }\n"
+ 	"  vec4 w = projToWorld * vec4( uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0 );\n"
+ 	"  vec3 P = w.xyz / w.w;\n"
+ 	"  float dist = length( cameraPos - P );\n"
+ 	"  vec4 prev = worldToProjPrev * vec4( P, 1.0 );\n"
+-	"  if ( prev.w <= 0.0 ) { gl_FragColor = vec4( 1.0 ); return; }\n"
++	"  if ( prev.w <= 0.0 ) { gl_FragColor = pass == 0 ? vec4( 1.0 ) : vec4( 0.0 ); return; }\n"
+ 	"  vec2 puv = vec2( prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5 );\n"
+-	"  if ( any( lessThan( puv, vec2( 0.0 ) ) ) || any( greaterThan( puv, vec2( 1.0 ) ) ) ) { gl_FragColor = vec4( 1.0 ); return; }\n"
++	"  if ( any( lessThan( puv, vec2( 0.0 ) ) ) || any( greaterThan( puv, vec2( 1.0 ) ) ) ) { gl_FragColor = pass == 0 ? vec4( 1.0 ) : vec4( 0.0 ); return; }\n"
+ 	"  vec2 hp = puv * halfSize - 0.5;\n"
+ 	"  vec2 base = floor( hp );\n"
+ 	"  vec2 f = hp - base;\n"
+ 	"  // depth-weighted bilinear: the 2x2 half-res samples, each weighted by its bilinear weight and by\n"
+ 	"  // how well its view distance matches this pixel's; a lone matching sample still wins\n"
+ 	"  vec2 acc = vec2( 0.0 ); float wsum = 0.0; float tol = 0.02 * dist + 2.0;\n"
++	"  vec4 racc = vec4( 0.0 );\n"
+ 	"  vec4 best = vec4( 1.0, 1.0, 0.0, 0.0 ); float bestErr = 1e30;\n"
+ 	"  for ( int dy = 0; dy <= 1; dy++ ) for ( int dx = 0; dx <= 1; dx++ ) {\n"
+ 	"    vec2 q = clamp( base + vec2( float( dx ), float( dy ) ), vec2( 0.0 ), halfSize - 1.0 ) + 0.5;\n"
+@@ -138,17 +146,23 @@ static const char *s_pReprojectFragmentShader =
+ 	"    float wb = ( dx == 0 ? 1.0 - f.x : f.x ) * ( dy == 0 ? 1.0 - f.y : f.y );\n"
+ 	"    float w = wb * exp( -err / tol );\n"
+ 	"    acc += s.rg * w; wsum += w;\n"
++	"    if ( hasRefl != 0 ) racc += texture2DRect( reflTex, q ) * w;\n"
+ 	"    if ( err < bestErr ) { bestErr = err; best = s; }\n"
+ 	"  }\n"
+-	"  if ( bestErr > 0.1 * dist + 8.0 ) { gl_FragColor = vec4( 1.0 ); return; }\n"
+-	"  if ( wsum > 1e-4 ) best.rg = acc / wsum;\n"
++	"  if ( bestErr > 0.1 * dist + 8.0 ) { gl_FragColor = pass == 0 ? vec4( 1.0 ) : vec4( 0.0 ); return; }\n"
++	"  vec4 refl = vec4( 0.0 );\n"
++	"  if ( wsum > 1e-4 ) { best.rg = acc / wsum; refl = racc / wsum; }\n"
++	"  refl.a = clamp( refl.a, 0.0, 1.0 );\n"
+ 	"  float ao = mix( 1.0, best.r, aoStrength );\n"
+ 	"  float sun = mix( 1.0, best.g, shadowStrength );\n"
+-	"  vec4 o = vec4( vec3( ao * sun ), 1.0 );\n"
++	"  vec4 o = vec4( vec3( ao * sun * ( 1.0 - refl.a ) ), 1.0 );\n"
++	"  if ( pass == 1 ) o = vec4( refl.rgb * refl.a, 1.0 );\n"
+ 	"  if ( debugMode == 1 ) o = vec4( vec3( best.r ), 1.0 );\n"
+ 	"  else if ( debugMode == 2 || debugMode >= 7 ) o = vec4( vec3( best.g ), 1.0 );\n"
+ 	"  else if ( debugMode == 3 ) o = vec4( texture2DRect( normalTex, hp + 0.5 ).xyz * 0.5 + 0.5, 1.0 );\n"
+ 	"  else if ( debugMode == 4 ) o = vec4( vec3( clamp( dist / 2048.0, 0.0, 1.0 ) ), 1.0 );\n"
++	"  else if ( debugMode == 5 ) o = vec4( refl.rgb, 1.0 );\n"
++	"  else if ( debugMode == 6 ) o = vec4( vec3( refl.a ), 1.0 );\n"
+ 	"  gl_FragColor = o;\n"
+ 	"}\n";
+ 
+@@ -262,7 +276,7 @@ void CGLMRayTraceHooks::DrawFullscreenQuad()
+ 	glEnd();
+ }
+ 
+-bool CGLMRayTraceHooks::ResolveDepth( IOSurfaceRef depthSurface, void **ppFence )
++bool CGLMRayTraceHooks::ResolveDepth( IOSurfaceRef depthSurface, void **ppFence, IOSurfaceRef colorSurface )
+ {
+ 	if ( ppFence ) *ppFence = NULL;
+ 	if ( s_bFailed )
+@@ -315,6 +329,25 @@ bool CGLMRayTraceHooks::ResolveDepth( IOSurfaceRef depthSurface, void **ppFence
+ 		depthTexName = s_depthResolveTex;
+ 	}
+ 
++	// Scene colour (for reflections): a straight blit, which also resolves MSAA. The tracer rotates
++	// through three surfaces; cache a texture per surface.
++	if ( colorSurface )
++	{
++		int slot = 0;
++		for ( int i = 0; i < 3; i++ ) if ( s_colorSurface[i] == colorSurface ) { slot = i; break; }
++		if ( s_colorSurface[slot] != colorSurface )
++			for ( int i = 0; i < 3; i++ ) if ( !s_colorSurface[i] ) { slot = i; break; }
++		GLuint colorTex = SurfaceTexture( colorSurface, &s_colorTexName[slot], &s_colorSurface[slot], &s_colorW[slot], &s_colorH[slot] );
++		if ( colorTex )
++		{
++			if ( !s_colorFBO ) glGenFramebuffersEXT( 1, &s_colorFBO );
++			glBindFramebufferEXT( GL_DRAW_FRAMEBUFFER_EXT, s_colorFBO );
++			glFramebufferTexture2DEXT( GL_DRAW_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_RECTANGLE_ARB, colorTex, 0 );
++			glBindFramebufferEXT( GL_READ_FRAMEBUFFER_EXT, fbo->m_name );
++			glBlitFramebufferEXT( 0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST );
++		}
++	}
++
+ 	// Pack into the IOSurface texture.
+ 	GLuint packTex = SurfaceTexture( depthSurface, &s_depthPackTexName, &s_depthPackSurface, &s_depthPackW, &s_depthPackH );
+ 	if ( !packTex ) { s_bFailed = true; RestoreState( saved ); return false; }
+@@ -399,7 +432,7 @@ bool CGLMRayTraceHooks::WaitFence( void *pFence, unsigned long long nTimeoutNs )
+ 	return false;
+ }
+ 
+-bool CGLMRayTraceHooks::CompositeReprojected( IOSurfaceRef filteredSurface, IOSurfaceRef normalSurface, int nHalfW, int nHalfH, const float *pProjToWorld, const float *pWorldToProjPrev, const float *pCameraPos, float flAOStrength, float flShadowStrength, int nDebugMode )
++bool CGLMRayTraceHooks::CompositeReprojected( IOSurfaceRef filteredSurface, IOSurfaceRef normalSurface, IOSurfaceRef reflSurface, int nHalfW, int nHalfH, const float *pProjToWorld, const float *pWorldToProjPrev, const float *pCameraPos, float flAOStrength, float flShadowStrength, int nDebugMode )
+ {
+ 	if ( s_bFailed )
+ 		return false;
+@@ -426,6 +459,7 @@ bool CGLMRayTraceHooks::CompositeReprojected( IOSurfaceRef filteredSurface, IOSu
+ 		for ( int i = 0; i < 3; i++ ) if ( !s_filteredSurface[i] ) { slot = i; break; }
+ 	GLuint filteredTex = SurfaceTexture( filteredSurface, &s_filteredTexName[slot], &s_filteredSurface[slot], &s_filteredW[slot], &s_filteredH[slot], true );
+ 	GLuint normalTex = normalSurface ? SurfaceTexture( normalSurface, &s_normalTexName[slot], &s_normalSurface[slot], &s_normalW[slot], &s_normalH[slot], true ) : 0;
++	GLuint reflTex = reflSurface ? SurfaceTexture( reflSurface, &s_reflTexName[slot], &s_reflSurface[slot], &s_reflW[slot], &s_reflH[slot], true ) : 0;
+ 	if ( !filteredTex ) { s_bFailed = true; RestoreState( saved ); return false; }
+ 
+ 	glBindFramebufferEXT( GL_FRAMEBUFFER_EXT, fbo->m_name );
+@@ -447,9 +481,14 @@ bool CGLMRayTraceHooks::CompositeReprojected( IOSurfaceRef filteredSurface, IOSu
+ 	glBindTexture( GL_TEXTURE_RECTANGLE_ARB, filteredTex );
+ 	glActiveTexture( GL_TEXTURE2 );
+ 	glBindTexture( GL_TEXTURE_RECTANGLE_ARB, normalTex );
++	glActiveTexture( GL_TEXTURE3 );
++	glBindTexture( GL_TEXTURE_RECTANGLE_ARB, reflTex );
+ 	glUniform1i( glGetUniformLocation( s_reprojectProgram, "depthTex" ), 0 );
+ 	glUniform1i( glGetUniformLocation( s_reprojectProgram, "filteredTex" ), 1 );
+ 	glUniform1i( glGetUniformLocation( s_reprojectProgram, "normalTex" ), 2 );
++	glUniform1i( glGetUniformLocation( s_reprojectProgram, "reflTex" ), 3 );
++	glUniform1i( glGetUniformLocation( s_reprojectProgram, "hasRefl" ), reflTex ? 1 : 0 );
++	glUniform1i( glGetUniformLocation( s_reprojectProgram, "pass" ), 0 );
+ 	// Source matrices are row-major; GL wants column-major
+ 	glUniformMatrix4fv( glGetUniformLocation( s_reprojectProgram, "projToWorld" ), 1, GL_TRUE, pProjToWorld );
+ 	glUniformMatrix4fv( glGetUniformLocation( s_reprojectProgram, "worldToProjPrev" ), 1, GL_TRUE, pWorldToProjPrev );
+@@ -459,6 +498,13 @@ bool CGLMRayTraceHooks::CompositeReprojected( IOSurfaceRef filteredSurface, IOSu
+ 	glUniform1f( glGetUniformLocation( s_reprojectProgram, "shadowStrength" ), flShadowStrength );
+ 	glUniform1i( glGetUniformLocation( s_reprojectProgram, "debugMode" ), nDebugMode );
+ 	DrawFullscreenQuad();
++	if ( reflTex && nDebugMode == 0 )
++	{
++		// second pass adds the reflection colour
++		glBlendFunc( GL_ONE, GL_ONE );
++		glUniform1i( glGetUniformLocation( s_reprojectProgram, "pass" ), 1 );
++		DrawFullscreenQuad();
++	}
+ 	glActiveTexture( GL_TEXTURE0 );
+ 
+ 	GLenum err = glGetError();
+@@ -532,17 +578,17 @@ extern "C" __attribute__((visibility("default"))) bool GLMRT_ResolveDepth( void
+ {
+ 	return CGLMRayTraceHooks::ResolveDepth( (IOSurfaceRef)depthSurface, NULL );
+ }
+-extern "C" __attribute__((visibility("default"))) bool GLMRT_ResolveDepthAsync( void *depthSurface, void **ppFence )
++extern "C" __attribute__((visibility("default"))) bool GLMRT_ResolveDepthAsync( void *depthSurface, void **ppFence, void *colorSurface )
+ {
+-	return CGLMRayTraceHooks::ResolveDepth( (IOSurfaceRef)depthSurface, ppFence );
++	return CGLMRayTraceHooks::ResolveDepth( (IOSurfaceRef)depthSurface, ppFence, (IOSurfaceRef)colorSurface );
+ }
+ extern "C" __attribute__((visibility("default"))) bool GLMRT_WaitFence( void *pFence, unsigned long long nTimeoutNs )
+ {
+ 	return CGLMRayTraceHooks::WaitFence( pFence, nTimeoutNs );
+ }
+-extern "C" __attribute__((visibility("default"))) bool GLMRT_CompositeReprojected( void *filteredSurface, void *normalSurface, int nHalfW, int nHalfH, const float *pProjToWorld, const float *pWorldToProjPrev, const float *pCameraPos, float flAOStrength, float flShadowStrength, int nDebugMode )
++extern "C" __attribute__((visibility("default"))) bool GLMRT_CompositeReprojected( void *filteredSurface, void *normalSurface, void *reflSurface, int nHalfW, int nHalfH, const float *pProjToWorld, const float *pWorldToProjPrev, const float *pCameraPos, float flAOStrength, float flShadowStrength, int nDebugMode )
+ {
+-	return CGLMRayTraceHooks::CompositeReprojected( (IOSurfaceRef)filteredSurface, (IOSurfaceRef)normalSurface, nHalfW, nHalfH, pProjToWorld, pWorldToProjPrev, pCameraPos, flAOStrength, flShadowStrength, nDebugMode );
++	return CGLMRayTraceHooks::CompositeReprojected( (IOSurfaceRef)filteredSurface, (IOSurfaceRef)normalSurface, (IOSurfaceRef)reflSurface, nHalfW, nHalfH, pProjToWorld, pWorldToProjPrev, pCameraPos, flAOStrength, flShadowStrength, nDebugMode );
+ }
+ extern "C" __attribute__((visibility("default"))) bool GLMRT_Composite( void *resultSurface, int nResultWidth, int nResultHeight, int bReplace )
+ {
+-- 
+2.55.0
+
