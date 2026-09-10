@@ -1,0 +1,913 @@
+From 740b5282aa29d2ac65095290304f359f8be00c0e Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Thu, 10 Sep 2026 00:18:10 -0400
+Subject: [PATCH 9/9] macos-arm64: asynchronous ray tracing with reprojected
+ composite
+
+The depth captured at frame N is traced at N+1 (after a GL fence, never a
+finish) and composited at N+2 by a GL shader that reconstructs each pixel's
+world position from the current depth, projects it into the traced frame and
+takes the depth-nearest half-resolution sample. Three rotating slots of
+IOSurfaces; the Metal composite kernel is gone. The GPU now overlaps the GL
+frame with the tracer instead of the render thread stalling twice per frame:
+176 fps instead of ~100 at 1512x982 with AO, dynamic objects and shadows.
+Instance lists are keyed by frame so a slot is traced with the objects of its
+own frame. rt_async 0 restores the synchronous path.
+---
+ game/client/rt_layer.cpp                      |   4 +-
+ .../stdshaders/raytracecomposite.cpp          |   2 +
+ public/rtmetal/iraytracer.h                   |   6 +-
+ rtmetal/rtmetal.mm                            | 319 +++++++++++-------
+ togl/linuxwin/glmrt.cpp                       | 216 +++++++++++-
+ 5 files changed, 420 insertions(+), 127 deletions(-)
+
+diff --git a/game/client/rt_layer.cpp b/game/client/rt_layer.cpp
+index 3168b03..f489edd 100644
+--- a/game/client/rt_layer.cpp
++++ b/game/client/rt_layer.cpp
+@@ -45,6 +45,7 @@ static ConVar rt_ao_rays( "rt_ao_rays", "2", FCVAR_ARCHIVE, "AO rays per pixel p
+ static ConVar rt_static_props( "rt_static_props", "1", FCVAR_ARCHIVE, "Include static props in the ray-traced geometry (takes effect on map load)." );
+ static ConVar rt_dynamic( "rt_dynamic", "2", FCVAR_ARCHIVE, "Dynamic objects in the ray-traced geometry: 0 none, 1 rigid only (physics props, doors, brush entities), 2 also skinned (NPCs, ragdolls)." );
+ static ConVar rt_dynamic_range( "rt_dynamic_range", "3000", FCVAR_ARCHIVE, "Dynamic objects further than this from the camera are left out." );
++static ConVar rt_async( "rt_async", "1", FCVAR_ARCHIVE, "Trace with two frames of latency so the GPU never stalls (results are reprojected to the current view). 0 = synchronous." );
+ static ConVar rt_debug( "rt_debug", "0", 0, "0 off, 1 AO, 2 sun shadows, 3 normals, 4 depth, 7 any dynamic sun hit, 8 world sun hit, 9 both." );
+ static ConVar rt_stats( "rt_stats", "0", 0, "Print ray tracing timing to the console periodically." );
+ 
+@@ -482,7 +483,7 @@ static void UpdateDynamicInstances( const CViewSetup &view )
+ 		Msg( "[rt] %d instances this frame (%d bone floats)\n", s_Instances.Count(), s_BonePool.Count() );
+ 		s_nDumpDynamic = 0;
+ 	}
+-	pRT->SetInstances( s_Instances.Base(), s_Instances.Count(), s_BonePool.Base(), s_BonePool.Count() );
++	pRT->SetInstances( s_nFrame, s_Instances.Base(), s_Instances.Count(), s_BonePool.Base(), s_BonePool.Count() );
+ }
+ 
+ static int AppendStaticProps( CUtlVector<float> &verts, CUtlVector<unsigned int> &indices, int *pnProps )
+@@ -704,6 +705,7 @@ void RT_DrawComposite( const CViewSetup &view )
+ 	pVar = pMat->FindVar( "$rt_shadows", &bFound ); if ( bFound ) pVar->SetIntValue( rt_shadows.GetInt() );
+ 	pVar = pMat->FindVar( "$rt_divisor", &bFound ); if ( bFound ) pVar->SetIntValue( clamp( rt_divisor.GetInt(), 1, 4 ) );
+ 	pVar = pMat->FindVar( "$rt_aorays", &bFound ); if ( bFound ) pVar->SetIntValue( clamp( rt_ao_rays.GetInt(), 1, 8 ) );
++	pVar = pMat->FindVar( "$rt_async", &bFound ); if ( bFound ) pVar->SetIntValue( rt_async.GetInt() );
+ 	CMatRenderContextPtr pRenderContext( materials );
+ 	pRenderContext->DrawScreenSpaceQuad( pMat );
+ 
+diff --git a/materialsystem/stdshaders/raytracecomposite.cpp b/materialsystem/stdshaders/raytracecomposite.cpp
+index 08e7af7..ec0cc16 100644
+--- a/materialsystem/stdshaders/raytracecomposite.cpp
++++ b/materialsystem/stdshaders/raytracecomposite.cpp
+@@ -54,6 +54,7 @@ BEGIN_VS_SHADER_FLAGS( RayTraceComposite, "Ray tracing layer composite", SHADER_
+ 		SHADER_PARAM( RT_DIVISOR, SHADER_PARAM_TYPE_INTEGER, "2", "trace resolution divisor" )
+ 		SHADER_PARAM( RT_MODE, SHADER_PARAM_TYPE_INTEGER, "1", "0 = capture depth, 1 = trace and composite" )
+ 		SHADER_PARAM( RT_AORAYS, SHADER_PARAM_TYPE_INTEGER, "2", "AO rays per pixel per frame" )
++		SHADER_PARAM( RT_ASYNC, SHADER_PARAM_TYPE_INTEGER, "1", "Trace with two frames of latency" )
+ 	END_SHADER_PARAMS
+ 
+ 	SHADER_INIT_PARAMS()
+@@ -131,6 +132,7 @@ BEGIN_VS_SHADER_FLAGS( RayTraceComposite, "Ray tracing layer composite", SHADER_
+ 				fp.m_bShadows = params[RT_SHADOWS]->GetIntValue();
+ 				fp.m_nResolutionDivisor = params[RT_DIVISOR]->GetIntValue();
+ 				fp.m_nAORays = params[RT_AORAYS]->GetIntValue();
++				fp.m_bAsync = params[RT_ASYNC]->GetIntValue();
+ 				pRT->ApplyAndComposite( fp );
+ 			}
+ 		}
+diff --git a/public/rtmetal/iraytracer.h b/public/rtmetal/iraytracer.h
+index 6174921..90f2081 100644
+--- a/public/rtmetal/iraytracer.h
++++ b/public/rtmetal/iraytracer.h
+@@ -8,7 +8,7 @@
+ 
+ #include "interface.h"
+ 
+-#define RAYTRACER_INTERFACE_VERSION "RayTracer002"
++#define RAYTRACER_INTERFACE_VERSION "RayTracer003"
+ 
+ struct RTFrameParams
+ {
+@@ -26,6 +26,7 @@ struct RTFrameParams
+ 	int		m_bShadows;
+ 	int		m_nResolutionDivisor;		// 1 = full, 2 = half (default)
+ 	int		m_nAORays;					// AO rays per pixel per frame
++	int		m_bAsync;					// trace with two frames of latency (no GPU stalls); 0 = synchronous
+ };
+ 
+ // One dynamic object for a frame: an instance of a mesh created with CreateMesh.
+@@ -57,7 +58,8 @@ public:
+ 	virtual int CreateMesh( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned char *pBoneIndices4, const float *pBoneWeights4 ) = 0;
+ 	virtual void DestroyMesh( int nMesh ) = 0;
+ 	// Replaces this frame's dynamic instances (copied). pBonePool holds nPoolFloats floats. Any thread.
+-	virtual void SetInstances( const RTInstance *pInstances, int nInstances, const float *pBonePool, int nPoolFloats ) = 0;
++	// nFrame is the value that will arrive in RTFrameParams::m_nFrame for the same frame.
++	virtual void SetInstances( int nFrame, const RTInstance *pInstances, int nInstances, const float *pBonePool, int nPoolFloats ) = 0;
+ 	// Render thread only, GL context current.
+ 	// CaptureDepth: call right after the 3D scene is drawn (its depth is in the current drawing framebuffer).
+ 	virtual bool CaptureDepth( int nResolutionDivisor ) = 0;
+diff --git a/rtmetal/rtmetal.mm b/rtmetal/rtmetal.mm
+index 479c32c..537574e 100644
+--- a/rtmetal/rtmetal.mm
++++ b/rtmetal/rtmetal.mm
+@@ -21,7 +21,10 @@
+ // togl hooks, resolved at run time
+ typedef bool ( *GLMRT_GetBackbufferInfo_t )( int *, int *, int * );
+ typedef bool ( *GLMRT_ResolveDepth_t )( void * );
++typedef bool ( *GLMRT_ResolveDepthAsync_t )( void *, void ** );
++typedef bool ( *GLMRT_WaitFence_t )( void *, unsigned long long );
+ typedef bool ( *GLMRT_Composite_t )( void *, int, int, int );
++typedef bool ( *GLMRT_CompositeReprojected_t )( void *, void *, int, int, const float *, const float *, const float *, float, float, int );
+ 
+ static const char *s_pKernels = R"MSL(
+ #include <metal_stdlib>
+@@ -282,46 +285,6 @@ kernel void blur(constant Params& p [[buffer(0)]],
+     outTex.write(float4(wsum > 0.0 ? sum / wsum : c.rg, c.b, c.a), gid);
+ }
+ 
+-// full-res output: modulation colour (or a debug view), depth-aware upsample from half-res
+-kernel void composite(constant Params& p [[buffer(0)]],
+-                      texture2d<float, access::read> filteredTex [[texture(0)]],
+-                      texture2d<float, access::read> depthTex [[texture(1)]],
+-                      texture2d<float, access::read> normalTex [[texture(2)]],
+-                      texture2d<float, access::write> resultTex [[texture(3)]],
+-                      uint2 gid [[thread_position_in_grid]])
+-{
+-    if (gid.x >= (uint)p.fullW || gid.y >= (uint)p.fullH) return;
+-    int div = p.fullW / p.halfW;
+-    int2 h = clamp(int2(gid) / div, int2(0), int2(p.halfW - 1, p.halfH - 1));
+-    float d = unpackDepth(depthTex.read(gid));
+-    float4 out = float4(1.0);
+-    if (d < 0.99999) {
+-        float2 uv = (float2(gid) + 0.5) / float2(p.fullW, p.fullH);
+-        float dist = length(float3(p.cameraPos) - reconstruct(p, uv, d));
+-        // nearest of the 2x2 half-res neighbours by distance
+-        float2 best = float2(1.0); float bestErr = 1e30;
+-        for (int dy = 0; dy <= 1; dy++) for (int dx = 0; dx <= 1; dx++) {
+-            int2 q = clamp(h + int2(dx, dy) - int2((int(gid.x) % div) < div/2 ? 1 : 0, (int(gid.y) % div) < div/2 ? 1 : 0), int2(0), int2(p.halfW - 1, p.halfH - 1));
+-            float4 s = filteredTex.read(uint2(q));
+-            if (s.a == 0.0) continue;
+-            float err = abs(s.b - dist);
+-            if (err < bestErr) { bestErr = err; best = s.rg; }
+-        }
+-        float ao = mix(1.0, best.r, p.aoStrength);
+-        float sun = mix(1.0, best.g, p.shadowStrength);
+-        out = float4(ao * sun, ao * sun, ao * sun, 1.0);
+-        if (p.debugMode == 1) out = float4(best.r, best.r, best.r, 1.0);
+-        else if (p.debugMode == 2) out = float4(best.g, best.g, best.g, 1.0);
+-        else if (p.debugMode == 3) { float3 n = normalTex.read(uint2(h)).xyz; out = float4(n * 0.5 + 0.5, 1.0); }
+-        else if (p.debugMode == 4) { float v = saturate(dist / 2048.0); out = float4(v, v, v, 1.0); }
+-        else if (p.debugMode == 5) { float v = (d - 0.9) * 10.0; out = float4(saturate(v), saturate(v), saturate(v), 1.0); }
+-        else if (p.debugMode == 6) { float3 P = reconstruct(p, uv, d); out = float4(fract(P / 256.0), 1.0); }
+-        else if (p.debugMode >= 7) out = float4(best.g, best.g, best.g, 1.0);
+-    } else if (p.debugMode != 0) {
+-        out = float4(0.0, 0.0, 0.0, 1.0);
+-    }
+-    resultTex.write(out, gid);
+-}
+ )MSL";
+ 
+ struct RTParamsGPU
+@@ -360,9 +323,9 @@ class CRayTracerMetal : public IRayTracer
+ {
+ public:
+ 	CRayTracerMetal() : m_bInit( false ), m_bAvailable( false ), m_pDevice( nil ), m_pQueue( nil ), m_pAccel( nil ), m_pPendingAccel( nil ),
+-		m_depthSurface( NULL ), m_resultSurface( NULL ), m_nFullW( 0 ), m_nFullH( 0 ), m_nHalfW( 0 ), m_nHalfH( 0 ), m_nHistoryIndex( 0 ), m_bHistoryValid( false ),
+-		m_pfnGetBackbufferInfo( NULL ), m_pfnResolveDepth( NULL ), m_pfnComposite( NULL ), m_bDepthCaptured( false ), m_flTimeResolve( 0 ), m_flTimeMetalWall( 0 ), m_flTimeMetalGPU( 0 ), m_flTimeComposite( 0 ), m_nTimedFrames( 0 ),
+-		m_nNextMesh( 1 ), m_bPendingInstances( false ), m_pInstanceDescBuffer( nil ), m_pInstanceScratch( nil ), m_pProbe( nil ), m_pShadowBoxes( nil ), m_nShadowBoxes( 0 ), m_nShadowBoxCapacity( 0 ), m_pInstanceAS( nil ), m_nInstanceCapacity( 0 ), m_nFrameCounter( 0 ), m_nLastInstanceCount( 0 ), m_nLastSkinnedCount( 0 ), m_nStaticPropInstance( -1 ), m_flTimeDynamic( 0 ), m_pSkin( nil ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; }
++		m_nSlotCounter( 0 ), m_bAsync( true ), m_nFullW( 0 ), m_nFullH( 0 ), m_nHalfW( 0 ), m_nHalfH( 0 ), m_nHistoryIndex( 0 ), m_bHistoryValid( false ),
++		m_pfnGetBackbufferInfo( NULL ), m_pfnResolveDepth( NULL ), m_pfnResolveDepthAsync( NULL ), m_pfnWaitFence( NULL ), m_pfnComposite( NULL ), m_pfnCompositeReprojected( NULL ), m_bDepthCaptured( false ), m_flTimeResolve( 0 ), m_flTimeMetalWall( 0 ), m_flTimeMetalGPU( 0 ), m_flTimeMetalWait( 0 ), m_flTimeComposite( 0 ), m_nTimedFrames( 0 ),
++		m_nNextMesh( 1 ), m_nEncodeFrame( -1 ), m_pInstanceDescBuffer( nil ), m_pInstanceScratch( nil ), m_pProbe( nil ), m_pShadowBoxes( nil ), m_nShadowBoxes( 0 ), m_nShadowBoxCapacity( 0 ), m_pInstanceAS( nil ), m_nInstanceCapacity( 0 ), m_nFrameCounter( 0 ), m_nLastInstanceCount( 0 ), m_nLastSkinnedCount( 0 ), m_nStaticPropInstance( -1 ), m_flTimeDynamic( 0 ), m_pSkin( nil ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; memset( m_slots, 0, sizeof( m_slots ) ); }
+ 
+ 	virtual bool Init() OVERRIDE;
+ 	virtual bool IsAvailable() OVERRIDE { return m_bAvailable; }
+@@ -370,16 +333,33 @@ public:
+ 	virtual void ClearWorld() OVERRIDE;
+ 	virtual int CreateMesh( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned char *pBoneIndices4, const float *pBoneWeights4 ) OVERRIDE;
+ 	virtual void DestroyMesh( int nMesh ) OVERRIDE;
+-	virtual void SetInstances( const RTInstance *pInstances, int nInstances, const float *pBonePool, int nPoolFloats ) OVERRIDE;
++	virtual void SetInstances( int nFrame, const RTInstance *pInstances, int nInstances, const float *pBonePool, int nPoolFloats ) OVERRIDE;
+ 	virtual bool CaptureDepth( int nResolutionDivisor ) OVERRIDE;
+ 	virtual bool ApplyAndComposite( const RTFrameParams &params ) OVERRIDE;
++
++	// One per in-flight frame: the depth captured at frame N is traced at N+1 (once its GL fence has
++	// passed, without stalling) and composited at N+2, reprojected to that frame's camera.
++	struct FrameSlot_t
++	{
++		IOSurfaceRef depthSurface, filteredSurface, normalSurface;
++		id<MTLTexture> depthTex, filteredTex, normalTex;
++		void *pFence;
++		bool bDepthReady;		// GL resolve issued, fence pending or passed
++		bool bTraced;			// command buffer committed
++		id<MTLCommandBuffer> cb;
++		RTFrameParams params;
++		double flCommitTime;
++	};
+ 	virtual const char *GetStatus() OVERRIDE { snprintf( m_szStatusFull, sizeof( m_szStatusFull ), "%s; %s", m_szStatus, m_szTiming ); return m_szStatusFull; }
+ 	bool m_bDepthCaptured;
+-	double m_flTimeResolve, m_flTimeMetalWall, m_flTimeMetalGPU, m_flTimeComposite; int m_nTimedFrames; char m_szTiming[512]; char m_szStatusFull[800];
++	double m_flTimeResolve, m_flTimeMetalWall, m_flTimeMetalGPU, m_flTimeMetalWait, m_flTimeComposite; int m_nTimedFrames; char m_szTiming[512]; char m_szStatusFull[800];
+ 
+ private:
+ 	bool EnsureTargets( int w, int h, int divisor );
+ 	void SetStatus( const char *fmt, ... );
++	bool TraceSlot( FrameSlot_t &slot, bool bWaitForDepth );
++	bool WaitSlot( FrameSlot_t &slot );
++	void ReleaseSlots();
+ 	id<MTLAccelerationStructure> BuildPrimitiveAS( MTLPrimitiveAccelerationStructureDescriptor *desc, MTLAccelerationStructureSizes *pSizes );
+ 	MTLPrimitiveAccelerationStructureDescriptor *MeshDescriptor( const RTMesh_t &mesh, id<MTLBuffer> vb );
+ 	void DestroySkinnedInstance( RTSkinnedInstance_t &inst );
+@@ -389,9 +369,11 @@ private:
+ 	std::mutex m_meshMutex;
+ 	std::map<int, RTMesh_t> m_meshes;
+ 	int m_nNextMesh;
+-	std::vector<RTInstance> m_pendingInstances, m_frameInstances;
+-	std::vector<float> m_pendingBones, m_frameBones;
+-	bool m_bPendingInstances;
++	struct FrameInstances_t { std::vector<RTInstance> instances; std::vector<float> bones; };
++	std::map<int, FrameInstances_t> m_pendingByFrame;	// keyed by the client's frame number
++	std::vector<RTInstance> m_frameInstances;
++	std::vector<float> m_frameBones;
++	int m_nEncodeFrame;									// frame whose instances EncodeDynamicScene should use
+ 	std::map<unsigned int, RTSkinnedInstance_t> m_skinned;
+ 	id<MTLBuffer> m_pInstanceDescBuffer, m_pInstanceScratch, m_pProbe, m_pShadowBoxes;
+ 	int m_nShadowBoxes, m_nShadowBoxCapacity;
+@@ -404,18 +386,23 @@ private:
+ 	bool m_bInit, m_bAvailable;
+ 	id<MTLDevice> m_pDevice;
+ 	id<MTLCommandQueue> m_pQueue;
+-	id<MTLComputePipelineState> m_pTrace, m_pTemporal, m_pBlur, m_pComposite;
++	id<MTLComputePipelineState> m_pTrace, m_pTemporal, m_pBlur;
+ 	std::mutex m_accelMutex;
+ 	id<MTLAccelerationStructure> m_pAccel, m_pPendingAccel;
+ 	id<MTLBuffer> m_pVertexBuffer, m_pIndexBuffer;	// keep alive while the structure references them
+-	IOSurfaceRef m_depthSurface, m_resultSurface;
+-	id<MTLTexture> m_pDepthTex, m_pResultTex, m_pRawTex, m_pNormalTex, m_pFilteredTex, m_pHistory[2];
++	FrameSlot_t m_slots[3];
++	int m_nSlotCounter;			// increments per CaptureDepth
++	bool m_bAsync;
++	id<MTLTexture> m_pRawTex, m_pHistory[2];
+ 	int m_nFullW, m_nFullH, m_nHalfW, m_nHalfH, m_nHistoryIndex;
+ 	bool m_bHistoryValid;
+ 	float m_prevWorldToProj[16];
+ 	GLMRT_GetBackbufferInfo_t m_pfnGetBackbufferInfo;
+ 	GLMRT_ResolveDepth_t m_pfnResolveDepth;
++	GLMRT_ResolveDepthAsync_t m_pfnResolveDepthAsync;
++	GLMRT_WaitFence_t m_pfnWaitFence;
+ 	GLMRT_Composite_t m_pfnComposite;
++	GLMRT_CompositeReprojected_t m_pfnCompositeReprojected;
+ 	char m_szStatus[256];
+ };
+ 
+@@ -440,7 +427,7 @@ bool CRayTracerMetal::Init()
+ 		id<MTLLibrary> lib = [m_pDevice newLibraryWithSource:[NSString stringWithUTF8String:s_pKernels] options:nil error:&err];
+ 		if ( !lib ) { SetStatus( "kernel compile failed: %s", [[err localizedDescription] UTF8String] ); return false; }
+ 		struct { const char *name; id<MTLComputePipelineState> *out; } kernels[] = {
+-			{ "trace", &m_pTrace }, { "temporal", &m_pTemporal }, { "blur", &m_pBlur }, { "composite", &m_pComposite }, { "skin", &m_pSkin } };
++			{ "trace", &m_pTrace }, { "temporal", &m_pTemporal }, { "blur", &m_pBlur }, { "skin", &m_pSkin } };
+ 		for ( auto &k : kernels )
+ 		{
+ 			id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:k.name]];
+@@ -452,7 +439,10 @@ bool CRayTracerMetal::Init()
+ 		m_pfnGetBackbufferInfo = (GLMRT_GetBackbufferInfo_t)dlsym( RTLD_DEFAULT, "GLMRT_GetBackbufferInfo" );
+ 		m_pfnResolveDepth = (GLMRT_ResolveDepth_t)dlsym( RTLD_DEFAULT, "GLMRT_ResolveDepth" );
+ 		m_pfnComposite = (GLMRT_Composite_t)dlsym( RTLD_DEFAULT, "GLMRT_Composite" );
+-		if ( !m_pfnGetBackbufferInfo || !m_pfnResolveDepth || !m_pfnComposite ) { SetStatus( "togl hooks not found (libtogl.dylib without glmrt)" ); return false; }
++		m_pfnResolveDepthAsync = (GLMRT_ResolveDepthAsync_t)dlsym( RTLD_DEFAULT, "GLMRT_ResolveDepthAsync" );
++		m_pfnWaitFence = (GLMRT_WaitFence_t)dlsym( RTLD_DEFAULT, "GLMRT_WaitFence" );
++		m_pfnCompositeReprojected = (GLMRT_CompositeReprojected_t)dlsym( RTLD_DEFAULT, "GLMRT_CompositeReprojected" );
++		if ( !m_pfnGetBackbufferInfo || !m_pfnResolveDepth || !m_pfnComposite || !m_pfnResolveDepthAsync || !m_pfnWaitFence || !m_pfnCompositeReprojected ) { SetStatus( "togl hooks not found (libtogl.dylib without glmrt)" ); return false; }
+ 		m_bAvailable = true;
+ 		SetStatus( "ready on %s (%s ray tracing)", [[m_pDevice name] UTF8String], [m_pDevice supportsFamily:MTLGPUFamilyApple9] ? "hardware" : "software" );
+ 	}
+@@ -510,8 +500,8 @@ void CRayTracerMetal::ClearWorld()
+ 	for ( auto &kv : m_skinned )
+ 		DestroySkinnedInstance( kv.second );
+ 	m_skinned.clear();
+-	m_pendingInstances.clear(); m_pendingBones.clear(); m_frameInstances.clear(); m_frameBones.clear();
+-	m_bPendingInstances = true;	// an empty frame replaces whatever was queued
++	m_pendingByFrame.clear(); m_frameInstances.clear(); m_frameBones.clear();
++	m_nEncodeFrame = -1;
+ }
+ 
+ //-----------------------------------------------------------------------------
+@@ -600,12 +590,15 @@ void CRayTracerMetal::DestroyMesh( int nMesh )
+ 	}
+ }
+ 
+-void CRayTracerMetal::SetInstances( const RTInstance *pInstances, int nInstances, const float *pBonePool, int nPoolFloats )
++void CRayTracerMetal::SetInstances( int nFrame, const RTInstance *pInstances, int nInstances, const float *pBonePool, int nPoolFloats )
+ {
+ 	std::lock_guard<std::mutex> lock( m_meshMutex );
+-	m_pendingInstances.assign( pInstances, pInstances + ( nInstances > 0 ? nInstances : 0 ) );
+-	m_pendingBones.assign( pBonePool, pBonePool + ( nPoolFloats > 0 ? nPoolFloats : 0 ) );
+-	m_bPendingInstances = true;
++	FrameInstances_t &fi = m_pendingByFrame[nFrame];
++	fi.instances.assign( pInstances, pInstances + ( nInstances > 0 ? nInstances : 0 ) );
++	fi.bones.assign( pBonePool, pBonePool + ( nPoolFloats > 0 ? nPoolFloats : 0 ) );
++	// keep the queue short if the render side stops consuming
++	while ( m_pendingByFrame.size() > 8 )
++		m_pendingByFrame.erase( m_pendingByFrame.begin() );
+ }
+ 
+ static inline void PackTransform( const float *m /* row-major 3x4 */, MTLPackedFloat4x3 *pOut )
+@@ -623,11 +616,16 @@ static inline void PackTransform( const float *m /* row-major 3x4 */, MTLPackedF
+ bool CRayTracerMetal::EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArray *pKeepAlive, id<MTLAccelerationStructure> *ppInstanceAS, NSArray **ppPrimitiveASes, int *pnInstances )
+ {
+ 	std::lock_guard<std::mutex> lock( m_meshMutex );
+-	if ( m_bPendingInstances )
+ 	{
+-		m_frameInstances.swap( m_pendingInstances );
+-		m_frameBones.swap( m_pendingBones );
+-		m_bPendingInstances = false;
++		// the newest list at or before the frame being traced; older ones are dropped
++		auto it = m_pendingByFrame.upper_bound( m_nEncodeFrame );
++		if ( it != m_pendingByFrame.begin() )
++		{
++			--it;
++			m_frameInstances.swap( it->second.instances );
++			m_frameBones.swap( it->second.bones );
++			m_pendingByFrame.erase( m_pendingByFrame.begin(), ++it );
++		}
+ 	}
+ 	m_nFrameCounter++;
+ 
+@@ -807,25 +805,44 @@ static id<MTLTexture> MakeTex( id<MTLDevice> dev, MTLPixelFormat fmt, int w, int
+ 	return [dev newTextureWithDescriptor:td];
+ }
+ 
++void CRayTracerMetal::ReleaseSlots()
++{
++	for ( int i = 0; i < 3; i++ )
++	{
++		FrameSlot_t &sl = m_slots[i];
++		if ( sl.cb ) { [sl.cb waitUntilCompleted]; [sl.cb release]; }
++		if ( sl.pFence ) m_pfnWaitFence( sl.pFence, 1000000000ull );
++		[sl.depthTex release]; [sl.filteredTex release]; [sl.normalTex release];
++		if ( sl.depthSurface ) CFRelease( sl.depthSurface );
++		if ( sl.filteredSurface ) CFRelease( sl.filteredSurface );
++		if ( sl.normalSurface ) CFRelease( sl.normalSurface );
++		memset( &sl, 0, sizeof( sl ) );
++	}
++}
++
+ bool CRayTracerMetal::EnsureTargets( int w, int h, int divisor )
+ {
+ 	int hw = w / divisor, hh = h / divisor;
+-	if ( m_nFullW == w && m_nFullH == h && m_nHalfW == hw && m_nHalfH == hh && m_depthSurface && m_resultSurface )
++	if ( m_nFullW == w && m_nFullH == h && m_nHalfW == hw && m_nHalfH == hh && m_slots[0].depthSurface )
+ 		return true;
+ 	@autoreleasepool
+ 	{
+-		[m_pDepthTex release]; [m_pResultTex release]; [m_pRawTex release]; [m_pNormalTex release]; [m_pFilteredTex release]; [m_pHistory[0] release]; [m_pHistory[1] release];
+-		if ( m_depthSurface ) CFRelease( m_depthSurface );
+-		if ( m_resultSurface ) CFRelease( m_resultSurface );
+-		NSDictionary *props = @{ (id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfacePixelFormat: @(0x42475241) };
+-		m_depthSurface = IOSurfaceCreate( (CFDictionaryRef)props );
+-		m_resultSurface = IOSurfaceCreate( (CFDictionaryRef)props );
+-		if ( !m_depthSurface || !m_resultSurface ) { SetStatus( "IOSurface creation failed" ); return false; }
+-		m_pDepthTex = MakeTex( m_pDevice, MTLPixelFormatBGRA8Unorm, w, h, m_depthSurface );
+-		m_pResultTex = MakeTex( m_pDevice, MTLPixelFormatBGRA8Unorm, w, h, m_resultSurface );
++		ReleaseSlots();
++		[m_pRawTex release]; [m_pHistory[0] release]; [m_pHistory[1] release];
++		NSDictionary *depthProps = @{ (id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfacePixelFormat: @(0x42475241) };
++		NSDictionary *halfProps = @{ (id)kIOSurfaceWidth: @(hw), (id)kIOSurfaceHeight: @(hh), (id)kIOSurfaceBytesPerElement: @8, (id)kIOSurfacePixelFormat: @(0x52476841) };	// RGhA: RGBA half
++		for ( int i = 0; i < 3; i++ )
++		{
++			FrameSlot_t &sl = m_slots[i];
++			sl.depthSurface = IOSurfaceCreate( (CFDictionaryRef)depthProps );
++			sl.filteredSurface = IOSurfaceCreate( (CFDictionaryRef)halfProps );
++			sl.normalSurface = IOSurfaceCreate( (CFDictionaryRef)halfProps );
++			if ( !sl.depthSurface || !sl.filteredSurface || !sl.normalSurface ) { SetStatus( "IOSurface creation failed" ); return false; }
++			sl.depthTex = MakeTex( m_pDevice, MTLPixelFormatBGRA8Unorm, w, h, sl.depthSurface );
++			sl.filteredTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, sl.filteredSurface );
++			sl.normalTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, sl.normalSurface );
++		}
+ 		m_pRawTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
+-		m_pNormalTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
+-		m_pFilteredTex = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
+ 		m_pHistory[0] = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
+ 		m_pHistory[1] = MakeTex( m_pDevice, MTLPixelFormatRGBA16Float, hw, hh, NULL );
+ 		m_nFullW = w; m_nFullH = h; m_nHalfW = hw; m_nHalfH = hh;
+@@ -852,17 +869,35 @@ bool CRayTracerMetal::CaptureDepth( int nResolutionDivisor )
+ 	int divisor = nResolutionDivisor >= 1 ? nResolutionDivisor : 2;
+ 	if ( !EnsureTargets( w, h, divisor ) )
+ 		return false;
++	FrameSlot_t &sl = m_slots[( m_nSlotCounter + 1 ) % 3];
++	// this slot was composited two frames ago; its trace must be complete before its depth is rewritten
++	if ( sl.cb ) { [sl.cb waitUntilCompleted]; [sl.cb release]; sl.cb = nil; }
++	if ( sl.pFence ) { m_pfnWaitFence( sl.pFence, 1000000000ull ); sl.pFence = NULL; }
++	sl.bTraced = false;
+ 	double t0 = CFAbsoluteTimeGetCurrent();
+-	m_bDepthCaptured = m_pfnResolveDepth( m_depthSurface );
++	if ( m_bAsync )
++		sl.bDepthReady = m_pfnResolveDepthAsync( sl.depthSurface, &sl.pFence );
++	else
++		sl.bDepthReady = m_pfnResolveDepth( sl.depthSurface );
+ 	m_flTimeResolve += ( CFAbsoluteTimeGetCurrent() - t0 ) * 1000.0;
++	if ( sl.bDepthReady )
++		m_nSlotCounter++;
++	m_bDepthCaptured = sl.bDepthReady;
+ 	return m_bDepthCaptured;
+ }
+ 
+-bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
++// Encodes and commits the trace for one slot's depth. bWaitForDepth: block on the GL fence
++// (synchronous mode); otherwise skip the frame if the resolve has not completed yet.
++bool CRayTracerMetal::TraceSlot( FrameSlot_t &slot, bool bWaitForDepth )
+ {
+-	if ( !m_bAvailable || !m_bDepthCaptured )
++	if ( !slot.bDepthReady || slot.bTraced )
+ 		return false;
+-	m_bDepthCaptured = false;
++	if ( slot.pFence )
++	{
++		if ( !m_pfnWaitFence( slot.pFence, bWaitForDepth ? 2000000000ull : 0 ) )
++			return false;
++		slot.pFence = NULL;
++	}
+ 	{
+ 		std::lock_guard<std::mutex> lock( m_accelMutex );
+ 		if ( m_pPendingAccel )
+@@ -875,6 +910,7 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 	}
+ 	if ( !m_pAccel )
+ 		return false;
++	const RTFrameParams &params = slot.params;
+ 
+ 	@autoreleasepool
+ 	{
+@@ -895,7 +931,6 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 		gp.hasSun = sunLen > 0.5f;
+ 		gp.historyValid = m_bHistoryValid;
+ 		gp.aoRays = params.m_nAORays > 0 ? params.m_nAORays : 1;
+-		gp.staticPropInstance = -1;	// set after the dynamic scene is encoded
+ 
+ 		double t0 = CFAbsoluteTimeGetCurrent();
+ 		id<MTLTexture> histIn = m_pHistory[m_nHistoryIndex], histOut = m_pHistory[m_nHistoryIndex ^ 1];
+@@ -904,6 +939,7 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 		id<MTLAccelerationStructure> instanceAS = nil; NSArray *prims = nil; int nInst = 0;
+ 		NSMutableArray *keepAlive = [NSMutableArray array];
+ 		double tDyn = CFAbsoluteTimeGetCurrent();
++		m_nEncodeFrame = params.m_nFrame;
+ 		if ( !EncodeDynamicScene( cb, keepAlive, &instanceAS, &prims, &nInst ) )
+ 			return false;
+ 		m_flTimeDynamic += ( CFAbsoluteTimeGetCurrent() - tDyn ) * 1000.0;
+@@ -912,7 +948,7 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 
+ 		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+ 		MTLSize tg = MTLSizeMake( 8, 8, 1 );
+-		MTLSize halfGrid = MTLSizeMake( m_nHalfW, m_nHalfH, 1 ), fullGrid = MTLSizeMake( m_nFullW, m_nFullH, 1 );
++		MTLSize halfGrid = MTLSizeMake( m_nHalfW, m_nHalfH, 1 );
+ 
+ 		[ce setComputePipelineState:m_pTrace];
+ 		[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
+@@ -922,63 +958,112 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 		[ce setBuffer:m_pShadowBoxes offset:0 atIndex:3];
+ 		for ( id<MTLAccelerationStructure> prim in prims )
+ 			[ce useResource:prim usage:MTLResourceUsageRead];
+-		[ce setTexture:m_pDepthTex atIndex:0]; [ce setTexture:m_pRawTex atIndex:1]; [ce setTexture:m_pNormalTex atIndex:2];
++		[ce setTexture:slot.depthTex atIndex:0]; [ce setTexture:m_pRawTex atIndex:1]; [ce setTexture:slot.normalTex atIndex:2];
+ 		[ce dispatchThreads:halfGrid threadsPerThreadgroup:tg];
+ 
+ 		[ce setComputePipelineState:m_pTemporal];
+ 		[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
+-		[ce setTexture:m_pRawTex atIndex:0]; [ce setTexture:m_pDepthTex atIndex:1]; [ce setTexture:histIn atIndex:2]; [ce setTexture:histOut atIndex:3];
++		[ce setTexture:m_pRawTex atIndex:0]; [ce setTexture:slot.depthTex atIndex:1]; [ce setTexture:histIn atIndex:2]; [ce setTexture:histOut atIndex:3];
+ 		[ce dispatchThreads:halfGrid threadsPerThreadgroup:tg];
+ 
+ 		[ce setComputePipelineState:m_pBlur];
+ 		[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
+-		[ce setTexture:histOut atIndex:0]; [ce setTexture:m_pNormalTex atIndex:1]; [ce setTexture:m_pFilteredTex atIndex:2];
++		[ce setTexture:histOut atIndex:0]; [ce setTexture:slot.normalTex atIndex:1]; [ce setTexture:slot.filteredTex atIndex:2];
+ 		[ce dispatchThreads:halfGrid threadsPerThreadgroup:tg];
+-
+-		[ce setComputePipelineState:m_pComposite];
+-		[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
+-		[ce setTexture:m_pFilteredTex atIndex:0]; [ce setTexture:m_pDepthTex atIndex:1]; [ce setTexture:m_pNormalTex atIndex:2]; [ce setTexture:m_pResultTex atIndex:3];
+-		[ce dispatchThreads:fullGrid threadsPerThreadgroup:tg];
+ 		[ce endEncoding];
+ 		[cb commit];
+-		// bounded wait: a GPU hang disables the layer instead of freezing the game
+-		double tw = CFAbsoluteTimeGetCurrent();
+-		while ( cb.status != MTLCommandBufferStatusCompleted && cb.status != MTLCommandBufferStatusError )
+-		{
+-			if ( CFAbsoluteTimeGetCurrent() - tw > 4.0 )
+-			{
+-				SetStatus( "GPU did not finish the ray tracing command buffer in 4 s (status %d, %d instances, %d skinned); ray tracing disabled", (int)cb.status, m_nLastInstanceCount, m_nLastSkinnedCount );
+-				m_bAvailable = false;
+-				return false;
+-			}
+-			usleep( 50 );
+-		}
+-		if ( cb.status == MTLCommandBufferStatusError )
+-		{
+-			SetStatus( "ray tracing command buffer failed: %s; ray tracing disabled", cb.error ? [[cb.error localizedDescription] UTF8String] : "unknown" );
+-			m_bAvailable = false;
+-			return false;
+-		}
+-		m_flTimeMetalGPU += ( cb.GPUEndTime - cb.GPUStartTime ) * 1000.0;
++		slot.cb = [cb retain];
++		slot.bTraced = true;
++		slot.flCommitTime = CFAbsoluteTimeGetCurrent();
+ 		m_flTimeMetalWall += ( CFAbsoluteTimeGetCurrent() - t0 ) * 1000.0;
+ 
+-		if ( params.m_nDebugMode >= 9 && ( params.m_nFrame % 60 ) == 0 )
+-		{
+-			const float *pr = (const float *)[m_pProbe contents];
+-			Msg( "[rt] probe: origin %.1f %.1f %.1f dir %.4f %.4f %.4f N %.3f %.3f %.3f hit dist %.1f instance %.0f prim %.0f\n", pr[0], pr[1], pr[2], pr[3], pr[4], pr[5], pr[9], pr[10], pr[11], pr[6], pr[7], pr[8] );
+-		}
+ 		m_nHistoryIndex ^= 1;
+ 		m_bHistoryValid = true;
+ 		memcpy( m_prevWorldToProj, params.m_worldToProjection, sizeof( m_prevWorldToProj ) );
+ 	}
++	return true;
++}
++
++// Waits (bounded) for a slot's trace. A hang or fault disables the layer instead of freezing the game.
++bool CRayTracerMetal::WaitSlot( FrameSlot_t &slot )
++{
++	if ( !slot.cb )
++		return false;
++	id<MTLCommandBuffer> cb = slot.cb;
++	double tw = CFAbsoluteTimeGetCurrent();
++	while ( cb.status != MTLCommandBufferStatusCompleted && cb.status != MTLCommandBufferStatusError )
++	{
++		if ( CFAbsoluteTimeGetCurrent() - tw > 4.0 )
++		{
++			SetStatus( "GPU did not finish the ray tracing command buffer in 4 s (status %d, %d instances, %d skinned); ray tracing disabled", (int)cb.status, m_nLastInstanceCount, m_nLastSkinnedCount );
++			m_bAvailable = false;
++			return false;
++		}
++		usleep( 50 );
++	}
++	if ( cb.status == MTLCommandBufferStatusError )
++	{
++		SetStatus( "ray tracing command buffer failed: %s; ray tracing disabled", cb.error ? [[cb.error localizedDescription] UTF8String] : "unknown" );
++		m_bAvailable = false;
++		return false;
++	}
++	m_flTimeMetalGPU += ( cb.GPUEndTime - cb.GPUStartTime ) * 1000.0;
++	m_flTimeMetalWait += ( CFAbsoluteTimeGetCurrent() - tw ) * 1000.0;
++	if ( slot.params.m_nDebugMode >= 9 && ( slot.params.m_nFrame % 60 ) == 0 )
++	{
++		const float *pr = (const float *)[m_pProbe contents];
++		Msg( "[rt] probe: origin %.1f %.1f %.1f dir %.4f %.4f %.4f N %.3f %.3f %.3f hit dist %.1f instance %.0f prim %.0f\n", pr[0], pr[1], pr[2], pr[3], pr[4], pr[5], pr[9], pr[10], pr[11], pr[6], pr[7], pr[8] );
++	}
++	[slot.cb release];
++	slot.cb = nil;
++	return true;
++}
++
++bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
++{
++	if ( !m_bAvailable || !m_bDepthCaptured )
++		return false;
++	m_bDepthCaptured = false;
++	m_bAsync = params.m_bAsync != 0;
++	// the slot captured this frame gets this frame's camera
++	FrameSlot_t &cur = m_slots[m_nSlotCounter % 3];
++	cur.params = params;
++
++	FrameSlot_t *pComposite = NULL;
++	if ( m_bAsync )
++	{
++		// trace last frame's depth (its resolve had a whole frame to finish), composite the frame before
++		FrameSlot_t &prev = m_slots[( m_nSlotCounter + 2 ) % 3];
++		if ( prev.bDepthReady && !prev.bTraced )
++			TraceSlot( prev, false );
++		FrameSlot_t &older = m_slots[( m_nSlotCounter + 1 ) % 3];
++		if ( older.bTraced && ( older.cb == nil || WaitSlot( older ) ) )
++			pComposite = &older;
++		else if ( prev.bTraced && prev.cb == nil )
++			pComposite = &prev;
++	}
++	else
++	{
++		if ( TraceSlot( cur, true ) && WaitSlot( cur ) )
++			pComposite = &cur;
++	}
++	if ( !m_bAvailable )
++		return false;
++
++	bool bOK = false;
+ 	double t1 = CFAbsoluteTimeGetCurrent();
+-	bool bOK = m_pfnComposite( m_resultSurface, m_nFullW, m_nFullH, params.m_nDebugMode != 0 );
++	if ( pComposite )
++	{
++		bOK = m_pfnCompositeReprojected( pComposite->filteredSurface, pComposite->normalSurface, m_nHalfW, m_nHalfH,
++			params.m_projectionToWorld, pComposite->params.m_worldToProjection, params.m_cameraPos,
++			params.m_flAOStrength, params.m_flShadowStrength, params.m_nDebugMode );
++	}
+ 	m_flTimeComposite += ( CFAbsoluteTimeGetCurrent() - t1 ) * 1000.0;
+ 	if ( ++m_nTimedFrames >= 120 )
+ 	{
+-		snprintf( m_szTiming, sizeof( m_szTiming ), "per frame: depth resolve %.2f ms, metal %.2f ms wall (%.2f ms GPU, %.2f ms encoding dynamic), composite %.2f ms; trace %dx%d; %d instances (%d skinned)",
+-			m_flTimeResolve / m_nTimedFrames, m_flTimeMetalWall / m_nTimedFrames, m_flTimeMetalGPU / m_nTimedFrames, m_flTimeDynamic / m_nTimedFrames, m_flTimeComposite / m_nTimedFrames, m_nHalfW, m_nHalfH, m_nLastInstanceCount, m_nLastSkinnedCount );
+-		m_flTimeResolve = m_flTimeMetalWall = m_flTimeMetalGPU = m_flTimeComposite = m_flTimeDynamic = 0.0; m_nTimedFrames = 0;
++		snprintf( m_szTiming, sizeof( m_szTiming ), "per frame: depth resolve %.2f ms, metal encode %.2f ms (%.2f ms GPU, %.2f ms waited, %.2f ms dynamic), composite %.2f ms; trace %dx%d %s; %d instances (%d skinned)",
++			m_flTimeResolve / m_nTimedFrames, m_flTimeMetalWall / m_nTimedFrames, m_flTimeMetalGPU / m_nTimedFrames, m_flTimeMetalWait / m_nTimedFrames, m_flTimeDynamic / m_nTimedFrames, m_flTimeComposite / m_nTimedFrames, m_nHalfW, m_nHalfH, m_bAsync ? "async" : "sync", m_nLastInstanceCount, m_nLastSkinnedCount );
++		m_flTimeResolve = m_flTimeMetalWall = m_flTimeMetalGPU = m_flTimeMetalWait = m_flTimeComposite = m_flTimeDynamic = 0.0; m_nTimedFrames = 0;
+ 	}
+ 	return bOK;
+ }
+diff --git a/togl/linuxwin/glmrt.cpp b/togl/linuxwin/glmrt.cpp
+index 9483d25..78f78db 100644
+--- a/togl/linuxwin/glmrt.cpp
++++ b/togl/linuxwin/glmrt.cpp
+@@ -18,6 +18,7 @@
+ #include <OpenGL/OpenGL.h>
+ #include <OpenGL/gl.h>
+ #include <OpenGL/glext.h>
++#include <unistd.h>
+ #include <OpenGL/CGLIOSurface.h>
+ #include <IOSurface/IOSurface.h>
+ 
+@@ -25,12 +26,14 @@ class CGLMRayTraceHooks
+ {
+ public:
+ 	static bool GetBackbufferInfo( int *pWidth, int *pHeight, int *pMSAA );
+-	static bool ResolveDepth( IOSurfaceRef depthSurface );
++	static bool ResolveDepth( IOSurfaceRef depthSurface, void **ppFence );
++	static bool WaitFence( void *pFence, unsigned long long nTimeoutNs );
+ 	static bool Composite( IOSurfaceRef resultSurface, int nResultWidth, int nResultHeight, bool bReplace );
++	static bool CompositeReprojected( IOSurfaceRef filteredSurface, IOSurfaceRef normalSurface, int nHalfW, int nHalfH, const float *pProjToWorld, const float *pWorldToProjPrev, const float *pCameraPos, float flAOStrength, float flShadowStrength, int nDebugMode );
+ 
+ private:
+ 	static bool GetDrawingFBO( CGLMFBO **ppFBO, CGLMTex **ppDepthTex );
+-	static GLuint SurfaceTexture( IOSurfaceRef surface, GLuint *pCachedName, IOSurfaceRef *pCachedSurface, int *pCachedW, int *pCachedH );
++	static GLuint SurfaceTexture( IOSurfaceRef surface, GLuint *pCachedName, IOSurfaceRef *pCachedSurface, int *pCachedW, int *pCachedH, bool bHalfFloat = false );
+ 	static GLuint BuildProgram( const char *pVertex, const char *pFragment );
+ 	static void DrawFullscreenQuad();
+ 
+@@ -47,6 +50,9 @@ private:
+ 	static GLuint s_packProgram, s_packProgramRect;
+ 	// composite resources
+ 	static GLuint s_resultTexName; static IOSurfaceRef s_resultSurface; static int s_resultW, s_resultH;
++	static GLuint s_reprojectProgram;
++	static GLuint s_filteredTexName[3]; static IOSurfaceRef s_filteredSurface[3]; static int s_filteredW[3], s_filteredH[3];
++	static GLuint s_normalTexName[3]; static IOSurfaceRef s_normalSurface[3]; static int s_normalW[3], s_normalH[3];
+ 	static GLuint s_compositeProgram;
+ 	static bool s_bFailed;
+ };
+@@ -55,6 +61,9 @@ GLuint CGLMRayTraceHooks::s_depthResolveFBO = 0; GLuint CGLMRayTraceHooks::s_dep
+ GLuint CGLMRayTraceHooks::s_depthPackFBO = 0; GLuint CGLMRayTraceHooks::s_depthPackTexName = 0; IOSurfaceRef CGLMRayTraceHooks::s_depthPackSurface = NULL; int CGLMRayTraceHooks::s_depthPackW = 0; int CGLMRayTraceHooks::s_depthPackH = 0;
+ GLuint CGLMRayTraceHooks::s_packProgram = 0; GLuint CGLMRayTraceHooks::s_packProgramRect = 0;
+ GLuint CGLMRayTraceHooks::s_resultTexName = 0; IOSurfaceRef CGLMRayTraceHooks::s_resultSurface = NULL; int CGLMRayTraceHooks::s_resultW = 0; int CGLMRayTraceHooks::s_resultH = 0;
++GLuint CGLMRayTraceHooks::s_reprojectProgram = 0;
++GLuint CGLMRayTraceHooks::s_filteredTexName[3] = { 0, 0, 0 }; IOSurfaceRef CGLMRayTraceHooks::s_filteredSurface[3] = { NULL, NULL, NULL }; int CGLMRayTraceHooks::s_filteredW[3] = { 0, 0, 0 }, CGLMRayTraceHooks::s_filteredH[3] = { 0, 0, 0 };
++GLuint CGLMRayTraceHooks::s_normalTexName[3] = { 0, 0, 0 }; IOSurfaceRef CGLMRayTraceHooks::s_normalSurface[3] = { NULL, NULL, NULL }; int CGLMRayTraceHooks::s_normalW[3] = { 0, 0, 0 }, CGLMRayTraceHooks::s_normalH[3] = { 0, 0, 0 };
+ GLuint CGLMRayTraceHooks::s_compositeProgram = 0;
+ bool CGLMRayTraceHooks::s_bFailed = false;
+ 
+@@ -86,6 +95,55 @@ static const char *s_pCompositeFragmentShader =
+ 	"uniform vec2 resultSize;\n"
+ 	"void main() { gl_FragColor = vec4( texture2DRect( resultTex, uv * resultSize ).rgb, 1.0 ); }\n";
+ 
++// Reprojecting composite: the tracer's half-resolution result (R ao, G sun, B view distance from
++// the camera it was traced with, A sample count) was computed for an earlier frame. Each pixel
++// reconstructs its world position from this frame's depth, projects it into the traced frame,
++// and takes the depth-nearest of the 2x2 half-res samples there.
++static const char *s_pReprojectFragmentShader =
++	"#version 120\n"
++	"#extension GL_ARB_texture_rectangle : enable\n"
++	"varying vec2 uv;\n"
++	"uniform sampler2D depthTex;\n"
++	"uniform sampler2DRect filteredTex;\n"
++	"uniform sampler2DRect normalTex;\n"
++	"uniform mat4 projToWorld;\n"
++	"uniform mat4 worldToProjPrev;\n"
++	"uniform vec3 cameraPos;\n"
++	"uniform vec2 halfSize;\n"
++	"uniform float aoStrength;\n"
++	"uniform float shadowStrength;\n"
++	"uniform int debugMode;\n"
++	"void main() {\n"
++	"  float d = texture2D( depthTex, uv ).r;\n"
++	"  if ( d >= 0.99999 ) { gl_FragColor = debugMode != 0 ? vec4( 0.0, 0.0, 0.0, 1.0 ) : vec4( 1.0 ); return; }\n"
++	"  vec4 w = projToWorld * vec4( uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0 );\n"
++	"  vec3 P = w.xyz / w.w;\n"
++	"  float dist = length( cameraPos - P );\n"
++	"  vec4 prev = worldToProjPrev * vec4( P, 1.0 );\n"
++	"  if ( prev.w <= 0.0 ) { gl_FragColor = vec4( 1.0 ); return; }\n"
++	"  vec2 puv = vec2( prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5 );\n"
++	"  if ( any( lessThan( puv, vec2( 0.0 ) ) ) || any( greaterThan( puv, vec2( 1.0 ) ) ) ) { gl_FragColor = vec4( 1.0 ); return; }\n"
++	"  vec2 hp = puv * halfSize - 0.5;\n"
++	"  vec2 base = floor( hp );\n"
++	"  vec4 best = vec4( 1.0, 1.0, 0.0, 0.0 ); float bestErr = 1e30;\n"
++	"  for ( int dy = 0; dy <= 1; dy++ ) for ( int dx = 0; dx <= 1; dx++ ) {\n"
++	"    vec2 q = clamp( base + vec2( float( dx ), float( dy ) ), vec2( 0.0 ), halfSize - 1.0 ) + 0.5;\n"
++	"    vec4 s = texture2DRect( filteredTex, q );\n"
++	"    if ( s.a <= 0.0 ) continue;\n"
++	"    float err = abs( s.b - dist );\n"
++	"    if ( err < bestErr ) { bestErr = err; best = s; }\n"
++	"  }\n"
++	"  if ( bestErr > 0.1 * dist + 8.0 ) { gl_FragColor = vec4( 1.0 ); return; }\n"
++	"  float ao = mix( 1.0, best.r, aoStrength );\n"
++	"  float sun = mix( 1.0, best.g, shadowStrength );\n"
++	"  vec4 o = vec4( vec3( ao * sun ), 1.0 );\n"
++	"  if ( debugMode == 1 ) o = vec4( vec3( best.r ), 1.0 );\n"
++	"  else if ( debugMode == 2 || debugMode >= 7 ) o = vec4( vec3( best.g ), 1.0 );\n"
++	"  else if ( debugMode == 3 ) o = vec4( texture2DRect( normalTex, hp + 0.5 ).xyz * 0.5 + 0.5, 1.0 );\n"
++	"  else if ( debugMode == 4 ) o = vec4( vec3( clamp( dist / 2048.0, 0.0, 1.0 ) ), 1.0 );\n"
++	"  gl_FragColor = o;\n"
++	"}\n";
++
+ extern GLMContext *g_pGLMRTContext;
+ 
+ bool CGLMRayTraceHooks::GetDrawingFBO( CGLMFBO **ppFBO, CGLMTex **ppDepthTex )
+@@ -141,7 +199,7 @@ GLuint CGLMRayTraceHooks::BuildProgram( const char *pVertex, const char *pFragme
+ 	return prog;
+ }
+ 
+-GLuint CGLMRayTraceHooks::SurfaceTexture( IOSurfaceRef surface, GLuint *pCachedName, IOSurfaceRef *pCachedSurface, int *pCachedW, int *pCachedH )
++GLuint CGLMRayTraceHooks::SurfaceTexture( IOSurfaceRef surface, GLuint *pCachedName, IOSurfaceRef *pCachedSurface, int *pCachedW, int *pCachedH, bool bHalfFloat )
+ {
+ 	int w = (int)IOSurfaceGetWidth( surface ), h = (int)IOSurfaceGetHeight( surface );
+ 	if ( *pCachedName && *pCachedSurface == surface && *pCachedW == w && *pCachedH == h )
+@@ -151,7 +209,9 @@ GLuint CGLMRayTraceHooks::SurfaceTexture( IOSurfaceRef surface, GLuint *pCachedN
+ 	GLuint tex = 0;
+ 	glGenTextures( 1, &tex );
+ 	glBindTexture( GL_TEXTURE_RECTANGLE_ARB, tex );
+-	CGLError err = CGLTexImageIOSurface2D( CGLGetCurrentContext(), GL_TEXTURE_RECTANGLE_ARB, GL_RGBA8, w, h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, surface, 0 );
++	CGLError err = bHalfFloat
++		? CGLTexImageIOSurface2D( CGLGetCurrentContext(), GL_TEXTURE_RECTANGLE_ARB, GL_RGBA16F_ARB, w, h, GL_RGBA, GL_HALF_FLOAT_ARB, surface, 0 )
++		: CGLTexImageIOSurface2D( CGLGetCurrentContext(), GL_TEXTURE_RECTANGLE_ARB, GL_RGBA8, w, h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, surface, 0 );
+ 	glTexParameteri( GL_TEXTURE_RECTANGLE_ARB, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
+ 	glTexParameteri( GL_TEXTURE_RECTANGLE_ARB, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
+ 	glBindTexture( GL_TEXTURE_RECTANGLE_ARB, 0 );
+@@ -194,8 +254,9 @@ void CGLMRayTraceHooks::DrawFullscreenQuad()
+ 	glEnd();
+ }
+ 
+-bool CGLMRayTraceHooks::ResolveDepth( IOSurfaceRef depthSurface )
++bool CGLMRayTraceHooks::ResolveDepth( IOSurfaceRef depthSurface, void **ppFence )
+ {
++	if ( ppFence ) *ppFence = NULL;
+ 	if ( s_bFailed )
+ 		return false;
+ 	CGLMFBO *fbo; CGLMTex *depth;
+@@ -261,7 +322,32 @@ bool CGLMRayTraceHooks::ResolveDepth( IOSurfaceRef depthSurface )
+ 	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE );
+ 	glUniform1i( glGetUniformLocation( s_packProgram, "depthTex" ), 0 );
+ 	DrawFullscreenQuad();
+-	glFinish();
++	if ( ppFence )
++	{
++		// the caller waits on this before Metal reads the surface; no glFinish here.
++		// GL_APPLE_fence is always present in the legacy profile; ARB_sync is the fallback.
++		static int s_nFenceKind = -1;
++		if ( s_nFenceKind < 0 )
++		{
++			const char *pExt = (const char *)glGetString( GL_EXTENSIONS );
++			s_nFenceKind = ( pExt && strstr( pExt, "GL_APPLE_fence" ) ) ? 1 : ( ( pExt && strstr( pExt, "GL_ARB_sync" ) ) ? 2 : 0 );
++			Msg( "[rt] GL fence: %s\n", s_nFenceKind == 1 ? "APPLE_fence" : s_nFenceKind == 2 ? "ARB_sync" : "none (finish)" );
++		}
++		if ( s_nFenceKind == 1 )
++		{
++			GLuint f = 0;
++			glGenFencesAPPLE( 1, &f );
++			glSetFenceAPPLE( f );
++			*ppFence = (void *)(uintptr_t)( ( (unsigned long long)f << 2 ) | 1 );
++		}
++		else if ( s_nFenceKind == 2 )
++			*ppFence = (void *)glFenceSync( GL_SYNC_GPU_COMMANDS_COMPLETE, 0 );
++		else
++			glFinish();
++		glFlush();
++	}
++	else
++		glFinish();
+ 
+ 	GLenum err = glGetError();
+ 	RestoreState( saved );
+@@ -274,6 +360,110 @@ bool CGLMRayTraceHooks::ResolveDepth( IOSurfaceRef depthSurface )
+ 	return true;
+ }
+ 
++bool CGLMRayTraceHooks::WaitFence( void *pFence, unsigned long long nTimeoutNs )
++{
++	if ( !pFence )
++		return true;
++	if ( ( (uintptr_t)pFence & 3 ) == 1 )
++	{
++		GLuint f = (GLuint)( (uintptr_t)pFence >> 2 );
++		if ( nTimeoutNs > 0 )
++		{
++			// APPLE_fence has no timed wait: poll, then block only if the timeout is generous
++			unsigned long long waited = 0;
++			while ( !glTestFenceAPPLE( f ) )
++			{
++				if ( waited >= nTimeoutNs ) return false;
++				usleep( 100 ); waited += 100000;
++			}
++		}
++		else if ( !glTestFenceAPPLE( f ) )
++			return false;
++		glDeleteFencesAPPLE( 1, &f );
++		return true;
++	}
++	GLenum r = glClientWaitSync( (GLsync)pFence, 0, nTimeoutNs );
++	if ( r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED )
++	{
++		glDeleteSync( (GLsync)pFence );
++		return true;
++	}
++	return false;
++}
++
++bool CGLMRayTraceHooks::CompositeReprojected( IOSurfaceRef filteredSurface, IOSurfaceRef normalSurface, int nHalfW, int nHalfH, const float *pProjToWorld, const float *pWorldToProjPrev, const float *pCameraPos, float flAOStrength, float flShadowStrength, int nDebugMode )
++{
++	if ( s_bFailed )
++		return false;
++	CGLMFBO *fbo; CGLMTex *depth;
++	if ( !GetDrawingFBO( &fbo, &depth ) )
++		return false;
++	int w = depth->m_layout->m_key.m_xSize, h = depth->m_layout->m_key.m_ySize;
++	if ( !s_depthResolveTex || s_depthResolveW != w || s_depthResolveH != h )
++		return false;	// no resolved depth for this frame
++
++	SavedState saved;
++	SaveState( saved );
++	while ( glGetError() != GL_NO_ERROR ) {}
++
++	if ( !s_reprojectProgram )
++	{
++		s_reprojectProgram = BuildProgram( s_pQuadVertexShader, s_pReprojectFragmentShader );
++		if ( !s_reprojectProgram ) { s_bFailed = true; RestoreState( saved ); return false; }
++	}
++	// cache slots by surface identity (the tracer rotates through three)
++	int slot = 0;
++	for ( int i = 0; i < 3; i++ ) if ( s_filteredSurface[i] == filteredSurface ) { slot = i; break; }
++	if ( s_filteredSurface[slot] != filteredSurface )
++		for ( int i = 0; i < 3; i++ ) if ( !s_filteredSurface[i] ) { slot = i; break; }
++	GLuint filteredTex = SurfaceTexture( filteredSurface, &s_filteredTexName[slot], &s_filteredSurface[slot], &s_filteredW[slot], &s_filteredH[slot], true );
++	GLuint normalTex = normalSurface ? SurfaceTexture( normalSurface, &s_normalTexName[slot], &s_normalSurface[slot], &s_normalW[slot], &s_normalH[slot], true ) : 0;
++	if ( !filteredTex ) { s_bFailed = true; RestoreState( saved ); return false; }
++
++	glBindFramebufferEXT( GL_FRAMEBUFFER_EXT, fbo->m_name );
++	glViewport( 0, 0, w, h );
++	glDisable( GL_DEPTH_TEST ); glDisable( GL_SCISSOR_TEST ); glDisable( GL_STENCIL_TEST ); glDisable( GL_CULL_FACE ); glDisable( GL_ALPHA_TEST );
++	glColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE );
++	if ( nDebugMode != 0 )
++		glDisable( GL_BLEND );
++	else
++	{
++		glEnable( GL_BLEND );
++		glBlendFunc( GL_DST_COLOR, GL_ZERO );	// multiply
++	}
++	glUseProgram( s_reprojectProgram );
++	glActiveTexture( GL_TEXTURE0 );
++	glBindTexture( GL_TEXTURE_2D, s_depthResolveTex );
++	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE );
++	glActiveTexture( GL_TEXTURE1 );
++	glBindTexture( GL_TEXTURE_RECTANGLE_ARB, filteredTex );
++	glActiveTexture( GL_TEXTURE2 );
++	glBindTexture( GL_TEXTURE_RECTANGLE_ARB, normalTex );
++	glUniform1i( glGetUniformLocation( s_reprojectProgram, "depthTex" ), 0 );
++	glUniform1i( glGetUniformLocation( s_reprojectProgram, "filteredTex" ), 1 );
++	glUniform1i( glGetUniformLocation( s_reprojectProgram, "normalTex" ), 2 );
++	// Source matrices are row-major; GL wants column-major
++	glUniformMatrix4fv( glGetUniformLocation( s_reprojectProgram, "projToWorld" ), 1, GL_TRUE, pProjToWorld );
++	glUniformMatrix4fv( glGetUniformLocation( s_reprojectProgram, "worldToProjPrev" ), 1, GL_TRUE, pWorldToProjPrev );
++	glUniform3fv( glGetUniformLocation( s_reprojectProgram, "cameraPos" ), 1, pCameraPos );
++	glUniform2f( glGetUniformLocation( s_reprojectProgram, "halfSize" ), (float)nHalfW, (float)nHalfH );
++	glUniform1f( glGetUniformLocation( s_reprojectProgram, "aoStrength" ), flAOStrength );
++	glUniform1f( glGetUniformLocation( s_reprojectProgram, "shadowStrength" ), flShadowStrength );
++	glUniform1i( glGetUniformLocation( s_reprojectProgram, "debugMode" ), nDebugMode );
++	DrawFullscreenQuad();
++	glActiveTexture( GL_TEXTURE0 );
++
++	GLenum err = glGetError();
++	RestoreState( saved );
++	if ( err != GL_NO_ERROR )
++	{
++		Warning( "[rt] GL error 0x%x in reprojecting composite; ray tracing disabled\n", err );
++		s_bFailed = true;
++		return false;
++	}
++	return true;
++}
++
+ bool CGLMRayTraceHooks::Composite( IOSurfaceRef resultSurface, int nResultWidth, int nResultHeight, bool bReplace )
+ {
+ 	if ( s_bFailed )
+@@ -332,7 +522,19 @@ extern "C" __attribute__((visibility("default"))) bool GLMRT_GetBackbufferInfo(
+ }
+ extern "C" __attribute__((visibility("default"))) bool GLMRT_ResolveDepth( void *depthSurface )
+ {
+-	return CGLMRayTraceHooks::ResolveDepth( (IOSurfaceRef)depthSurface );
++	return CGLMRayTraceHooks::ResolveDepth( (IOSurfaceRef)depthSurface, NULL );
++}
++extern "C" __attribute__((visibility("default"))) bool GLMRT_ResolveDepthAsync( void *depthSurface, void **ppFence )
++{
++	return CGLMRayTraceHooks::ResolveDepth( (IOSurfaceRef)depthSurface, ppFence );
++}
++extern "C" __attribute__((visibility("default"))) bool GLMRT_WaitFence( void *pFence, unsigned long long nTimeoutNs )
++{
++	return CGLMRayTraceHooks::WaitFence( pFence, nTimeoutNs );
++}
++extern "C" __attribute__((visibility("default"))) bool GLMRT_CompositeReprojected( void *filteredSurface, void *normalSurface, int nHalfW, int nHalfH, const float *pProjToWorld, const float *pWorldToProjPrev, const float *pCameraPos, float flAOStrength, float flShadowStrength, int nDebugMode )
++{
++	return CGLMRayTraceHooks::CompositeReprojected( (IOSurfaceRef)filteredSurface, (IOSurfaceRef)normalSurface, nHalfW, nHalfH, pProjToWorld, pWorldToProjPrev, pCameraPos, flAOStrength, flShadowStrength, nDebugMode );
+ }
+ extern "C" __attribute__((visibility("default"))) bool GLMRT_Composite( void *resultSurface, int nResultWidth, int nResultHeight, int bReplace )
+ {
+-- 
+2.55.0
+
