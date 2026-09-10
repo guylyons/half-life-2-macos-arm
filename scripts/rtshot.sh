@@ -19,7 +19,7 @@ if [ "$GAME" != hl2 ]; then
   [ -f "$TB/$GAME/videoconfig_mac.cfg" ] || cp "$TB/hl2/videoconfig_mac.cfg" "$TB/$GAME/videoconfig_mac.cfg"
   cp "$TB/hl2/cfg/autoexec.cfg" "$TB/$GAME/cfg/autoexec.cfg"
 fi
-(MTL_DEBUG_LAYER=${RTSHOT_MTLDEBUG:-0} MTL_SHADER_VALIDATION=${RTSHOT_MTLDEBUG:-0} MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 HL2_GAME="$GAME" HL2_BASE="$TB" "$ROOT/Half-Life 2.app/Contents/MacOS/Half-Life 2" -condebug -console +con_enable 1 +sv_cheats 1 +map "$MAP" ${LAUNCH[@]+"${LAUNCH[@]}"} > "$ROOT/rtshot.log" 2>&1 &)
+(HL2_RTNOOP=${RTSHOT_NOOP:-} HL2_SSQDIAG=${RTSHOT_SSQ:-} MTL_DEBUG_LAYER=${RTSHOT_MTLDEBUG:-0} MTL_SHADER_VALIDATION=${RTSHOT_MTLDEBUG:-0} MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 HL2_GAME="$GAME" HL2_BASE="$TB" "$ROOT/Half-Life 2.app/Contents/MacOS/Half-Life 2" -condebug -console +con_enable 1 +sv_cheats 1 +map "$MAP" ${LAUNCH[@]+"${LAUNCH[@]}"} > "$ROOT/rtshot.log" 2>&1 &)
 sleep "$WAIT"
 if [ -n "$CONS" ]; then
   osascript -e 'tell application "System Events" to tell process "hl2_launcher" to set frontmost to true' 2>/dev/null; sleep 1
