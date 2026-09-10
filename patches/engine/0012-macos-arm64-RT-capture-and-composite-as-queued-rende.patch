@@ -1,0 +1,369 @@
+From 48eac6c3432949a6532093c814c5def73aa549b4 Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Thu, 10 Sep 2026 02:11:53 -0400
+Subject: [PATCH 12/12] macos-arm64: RT capture and composite as queued
+ render-thread calls
+
+The capture and composite were screen-space quads with a shader whose draw
+pass ran the tracer. Saving a game flushes the material queue on the main
+thread for the thumbnail, where the engine's dynamic vertex buffers take a
+system-memory path that does not survive the unlock through togl: every
+manual or auto save crashed with ray tracing on. The client now queues plain
+function calls (ICallQueue::QueueCall) at the same points of the frame; the
+RayTraceComposite shader is gone. The hooks also only run for the player's
+view (save thumbnails and overlay views come through RenderView too).
+---
+ game/client/rt_layer.cpp                      | 100 ++++++------
+ game/client/viewrender.cpp                    |   9 +-
+ .../stdshaders/raytracecomposite.cpp          | 145 ------------------
+ materialsystem/stdshaders/wscript             |   1 -
+ 4 files changed, 53 insertions(+), 202 deletions(-)
+ delete mode 100644 materialsystem/stdshaders/raytracecomposite.cpp
+
+diff --git a/game/client/rt_layer.cpp b/game/client/rt_layer.cpp
+index 5018dd4..ec00273 100644
+--- a/game/client/rt_layer.cpp
++++ b/game/client/rt_layer.cpp
+@@ -13,8 +13,8 @@
+ #include "filesystem.h"
+ #include "ivrenderview.h"
+ #include "materialsystem/imaterialsystem.h"
+-#include "materialsystem/imaterialvar.h"
+ #include "materialsystem/imaterial.h"
++#include "tier1/callqueue.h"
+ #include "tier1/KeyValues.h"
+ #include "tier1/interface.h"
+ #include "mathlib/vmatrix.h"
+@@ -53,8 +53,6 @@ static ConVar rt_stats( "rt_stats", "0", 0, "Print ray tracing timing to the con
+ 
+ static IRayTracer *s_pRayTracer = NULL;
+ static bool s_bTriedLoad = false;
+-static IMaterial *s_pCompositeMaterial = NULL;
+-static IMaterial *s_pCaptureMaterial = NULL;
+ static Vector s_vSunDir( 0, 0, 0 );
+ static bool s_bWorldLoaded = false;
+ static int s_nFrame = 0;
+@@ -631,32 +629,25 @@ public:
+ static CRTLayerSystem s_RTLayerSystem;
+ 
+ //-----------------------------------------------------------------------------
+-// Per-frame composite
++// Per-frame capture and composite. Both run on the render thread (or wherever the
++// material system executes its queue) as queued function calls, at their place in
++// the frame; the GL context is current there. No screen-space quad is involved: the
++// engine's dynamic vertex buffers take a system-memory path when locked off the
++// render thread (save-game thumbnails flush the queue on the main thread), which
++// does not survive an unlock through togl.
+ //-----------------------------------------------------------------------------
+-static IMaterial *GetCompositeMaterial()
++static void RT_CaptureDepthOnRenderThread( int nDivisor )
+ {
+-	if ( !s_pCompositeMaterial )
+-	{
+-		KeyValues *pKV = new KeyValues( "RayTraceComposite" );
+-		pKV->SetInt( "$rt_mode", 1 );
+-		s_pCompositeMaterial = materials->CreateMaterial( "__rt_composite", pKV );
+-		if ( s_pCompositeMaterial )
+-			s_pCompositeMaterial->IncrementReferenceCount();
+-	}
+-	return s_pCompositeMaterial;
++	IRayTracer *pRT = GetRayTracer();
++	if ( pRT )
++		pRT->CaptureDepth( nDivisor );
+ }
+ 
+-static IMaterial *GetCaptureMaterial()
++static void RT_CompositeOnRenderThread( RTFrameParams fp )
+ {
+-	if ( !s_pCaptureMaterial )
+-	{
+-		KeyValues *pKV = new KeyValues( "RayTraceComposite" );
+-		pKV->SetInt( "$rt_mode", 0 );
+-		s_pCaptureMaterial = materials->CreateMaterial( "__rt_capture", pKV );
+-		if ( s_pCaptureMaterial )
+-			s_pCaptureMaterial->IncrementReferenceCount();
+-	}
+-	return s_pCaptureMaterial;
++	IRayTracer *pRT = GetRayTracer();
++	if ( pRT )
++		pRT->ApplyAndComposite( fp );
+ }
+ 
+ void RT_CaptureDepth()
+@@ -665,13 +656,13 @@ void RT_CaptureDepth()
+ 		return;
+ 	if ( !GetRayTracer() )
+ 		return;
+-	IMaterial *pMat = GetCaptureMaterial();
+-	if ( !pMat )
+-		return;
+-	bool bFound;
+-	IMaterialVar *pVar = pMat->FindVar( "$rt_divisor", &bFound ); if ( bFound ) pVar->SetIntValue( clamp( rt_divisor.GetInt(), 1, 4 ) );
++	int nDivisor = clamp( rt_divisor.GetInt(), 1, 4 );
+ 	CMatRenderContextPtr pRenderContext( materials );
+-	pRenderContext->DrawScreenSpaceQuad( pMat );
++	ICallQueue *pCallQueue = pRenderContext->GetCallQueue();
++	if ( pCallQueue )
++		pCallQueue->QueueCall( RT_CaptureDepthOnRenderThread, nDivisor );
++	else
++		RT_CaptureDepthOnRenderThread( nDivisor );
+ }
+ 
+ void RT_DrawComposite( const CViewSetup &view )
+@@ -681,9 +672,6 @@ void RT_DrawComposite( const CViewSetup &view )
+ 	IRayTracer *pRT = GetRayTracer();
+ 	if ( !pRT )
+ 		return;
+-	IMaterial *pMat = GetCompositeMaterial();
+-	if ( !pMat )
+-		return;
+ 
+ 	UpdateDynamicInstances( view );
+ 
+@@ -691,27 +679,33 @@ void RT_DrawComposite( const CViewSetup &view )
+ 	render->GetMatricesForView( view, &worldToView, &viewToProj, &worldToProj, &worldToPixels );
+ 	VMatrix projToWorld;
+ 	MatrixInverseGeneral( worldToProj, projToWorld );
+-	bool bFound;
+-	IMaterialVar *pVar;
+-	pVar = pMat->FindVar( "$rt_worldtoproj", &bFound ); if ( bFound ) pVar->SetMatrixValue( worldToProj );
+-	pVar = pMat->FindVar( "$rt_projtoworld", &bFound ); if ( bFound ) pVar->SetMatrixValue( projToWorld );
+-	pVar = pMat->FindVar( "$rt_camerapos", &bFound ); if ( bFound ) pVar->SetVecValue( view.origin.Base(), 3 );
+-	pVar = pMat->FindVar( "$rt_sundir", &bFound ); if ( bFound ) pVar->SetVecValue( s_vSunDir.Base(), 3 );
+-	pVar = pMat->FindVar( "$rt_aoradius", &bFound ); if ( bFound ) pVar->SetFloatValue( rt_ao_radius.GetFloat() );
+-	pVar = pMat->FindVar( "$rt_aostrength", &bFound ); if ( bFound ) pVar->SetFloatValue( rt_ao_strength.GetFloat() );
+-	pVar = pMat->FindVar( "$rt_shadowstrength", &bFound ); if ( bFound ) pVar->SetFloatValue( rt_shadow_strength.GetFloat() );
+-	pVar = pMat->FindVar( "$rt_sunangle", &bFound ); if ( bFound ) pVar->SetFloatValue( rt_sun_angle.GetFloat() );
+-	pVar = pMat->FindVar( "$rt_frame", &bFound ); if ( bFound ) pVar->SetIntValue( s_nFrame++ );
+-	pVar = pMat->FindVar( "$rt_debug", &bFound ); if ( bFound ) pVar->SetIntValue( rt_debug.GetInt() );
+-	pVar = pMat->FindVar( "$rt_ao", &bFound ); if ( bFound ) pVar->SetIntValue( rt_ao.GetInt() );
+-	pVar = pMat->FindVar( "$rt_shadows", &bFound ); if ( bFound ) pVar->SetIntValue( rt_shadows.GetInt() );
+-	pVar = pMat->FindVar( "$rt_divisor", &bFound ); if ( bFound ) pVar->SetIntValue( clamp( rt_divisor.GetInt(), 1, 4 ) );
+-	pVar = pMat->FindVar( "$rt_aorays", &bFound ); if ( bFound ) pVar->SetIntValue( clamp( rt_ao_rays.GetInt(), 1, 8 ) );
+-	pVar = pMat->FindVar( "$rt_async", &bFound ); if ( bFound ) pVar->SetIntValue( rt_async.GetInt() );
+-	pVar = pMat->FindVar( "$rt_coherent", &bFound ); if ( bFound ) pVar->SetIntValue( rt_coherent.GetInt() );
+-	pVar = pMat->FindVar( "$rt_budget", &bFound ); if ( bFound ) pVar->SetFloatValue( rt_budget.GetFloat() );
++
++	RTFrameParams fp;
++	memset( &fp, 0, sizeof( fp ) );
++	memcpy( fp.m_worldToProjection, worldToProj.Base(), sizeof( fp.m_worldToProjection ) );
++	memcpy( fp.m_projectionToWorld, projToWorld.Base(), sizeof( fp.m_projectionToWorld ) );
++	memcpy( fp.m_cameraPos, view.origin.Base(), sizeof( fp.m_cameraPos ) );
++	memcpy( fp.m_sunDir, s_vSunDir.Base(), sizeof( fp.m_sunDir ) );
++	fp.m_flAORadius = rt_ao_radius.GetFloat();
++	fp.m_flAOStrength = rt_ao_strength.GetFloat();
++	fp.m_flShadowStrength = rt_shadow_strength.GetFloat();
++	fp.m_flSunAngleDeg = rt_sun_angle.GetFloat();
++	fp.m_nFrame = s_nFrame++;
++	fp.m_nDebugMode = rt_debug.GetInt();
++	fp.m_bAO = rt_ao.GetInt();
++	fp.m_bShadows = rt_shadows.GetInt();
++	fp.m_nResolutionDivisor = clamp( rt_divisor.GetInt(), 1, 4 );
++	fp.m_nAORays = clamp( rt_ao_rays.GetInt(), 1, 8 );
++	fp.m_bAsync = rt_async.GetInt();
++	fp.m_bCoherent = rt_coherent.GetInt();
++	fp.m_flBudgetMs = rt_budget.GetFloat();
++
+ 	CMatRenderContextPtr pRenderContext( materials );
+-	pRenderContext->DrawScreenSpaceQuad( pMat );
++	ICallQueue *pCallQueue = pRenderContext->GetCallQueue();
++	if ( pCallQueue )
++		pCallQueue->QueueCall( RT_CompositeOnRenderThread, fp );
++	else
++		RT_CompositeOnRenderThread( fp );
+ 
+ 	if ( rt_stats.GetBool() && ( s_nFrame % 300 ) == 0 )
+ 		Msg( "[rt] %s\n", pRT->GetStatus() );
+diff --git a/game/client/viewrender.cpp b/game/client/viewrender.cpp
+index 8daa351..20c0bc8 100644
+--- a/game/client/viewrender.cpp
++++ b/game/client/viewrender.cpp
+@@ -2017,8 +2017,10 @@ void CViewRender::RenderView( const CViewSetup &view, int nClearFlags, int whatT
+ 		// Finish scene
+ 		render->SceneEnd();
+ 
+-		// ray-traced lighting layer: grab the scene depth before post-processing reuses the depth buffer (macOS arm64 port)
+-		RT_CaptureDepth();
++		// ray-traced lighting layer: grab the scene depth before post-processing reuses the depth buffer (macOS arm64 port).
++		// Only for the player's view: save-game thumbnails and overlay views also come through here.
++		if ( whatToDraw & RENDERVIEW_DRAWHUD )
++			RT_CaptureDepth();
+ 
+ 		// Draw lightsources if enabled
+ 		render->DrawLights();
+@@ -2094,7 +2096,8 @@ void CViewRender::RenderView( const CViewSetup &view, int nClearFlags, int whatT
+ 		PerformScreenSpaceEffects( 0, 0, view.width, view.height );
+ 
+ 		// ray-traced lighting layer (macOS arm64 port)
+-		RT_DrawComposite( view );
++		if ( whatToDraw & RENDERVIEW_DRAWHUD )
++			RT_DrawComposite( view );
+ 
+ 		if ( g_pMaterialSystemHardwareConfig->GetHDRType() == HDR_TYPE_INTEGER )
+ 		{
+diff --git a/materialsystem/stdshaders/raytracecomposite.cpp b/materialsystem/stdshaders/raytracecomposite.cpp
+deleted file mode 100644
+index f307ffb..0000000
+--- a/materialsystem/stdshaders/raytracecomposite.cpp
++++ /dev/null
+@@ -1,145 +0,0 @@
+-//========= Ray tracing layer: composite shader (macOS arm64 port) ==============
+-// The client draws a fullscreen quad with material "rt/composite" after the
+-// 3D scene. This shader draws nothing itself; its dynamic pass runs on the
+-// render thread with the GL context current and hands the frame to the Metal
+-// ray tracer, which resolves depth, traces, and multiplies its result onto
+-// the framebuffer through togl. Matrix/sun parameters travel as material vars
+-// so they are in sync with the queued render thread.
+-//=============================================================================
+-#include "BaseVSShader.h"
+-#include "screenspaceeffect_vs20.inc"
+-#include "Bloom_ps20.inc"
+-#include "Bloom_ps20b.inc"
+-#include "rtmetal/iraytracer.h"
+-#include "tier1/interface.h"
+-#include "mathlib/vmatrix.h"
+-
+-static IRayTracer *s_pRayTracer = NULL;
+-static bool s_bTriedLoad = false;
+-
+-static IRayTracer *GetRayTracer()
+-{
+-	if ( !s_bTriedLoad )
+-	{
+-		s_bTriedLoad = true;
+-		CSysModule *pModule = Sys_LoadModule( "rtmetal" );
+-		if ( pModule )
+-		{
+-			CreateInterfaceFn factory = Sys_GetFactory( pModule );
+-			if ( factory )
+-				s_pRayTracer = (IRayTracer *)factory( RAYTRACER_INTERFACE_VERSION, NULL );
+-		}
+-		if ( s_pRayTracer && !s_pRayTracer->Init() )
+-			s_pRayTracer = NULL;
+-		if ( !s_pRayTracer )
+-			Warning( "[rt] rtmetal module unavailable; ray tracing disabled\n" );
+-	}
+-	return s_pRayTracer;
+-}
+-
+-BEGIN_VS_SHADER_FLAGS( RayTraceComposite, "Ray tracing layer composite", SHADER_NOT_EDITABLE )
+-	BEGIN_SHADER_PARAMS
+-		SHADER_PARAM( RT_WORLDTOPROJ, SHADER_PARAM_TYPE_MATRIX, "", "world to projection matrix" )
+-		SHADER_PARAM( RT_PROJTOWORLD, SHADER_PARAM_TYPE_MATRIX, "", "projection to world matrix" )
+-		SHADER_PARAM( RT_CAMERAPOS, SHADER_PARAM_TYPE_VEC3, "[0 0 0]", "camera position" )
+-		SHADER_PARAM( RT_SUNDIR, SHADER_PARAM_TYPE_VEC3, "[0 0 0]", "direction toward the sun" )
+-		SHADER_PARAM( RT_AORADIUS, SHADER_PARAM_TYPE_FLOAT, "96", "" )
+-		SHADER_PARAM( RT_AOSTRENGTH, SHADER_PARAM_TYPE_FLOAT, "0.8", "" )
+-		SHADER_PARAM( RT_SHADOWSTRENGTH, SHADER_PARAM_TYPE_FLOAT, "0.6", "" )
+-		SHADER_PARAM( RT_SUNANGLE, SHADER_PARAM_TYPE_FLOAT, "1.0", "" )
+-		SHADER_PARAM( RT_FRAME, SHADER_PARAM_TYPE_INTEGER, "0", "" )
+-		SHADER_PARAM( RT_DEBUG, SHADER_PARAM_TYPE_INTEGER, "0", "" )
+-		SHADER_PARAM( RT_AO, SHADER_PARAM_TYPE_INTEGER, "1", "" )
+-		SHADER_PARAM( RT_SHADOWS, SHADER_PARAM_TYPE_INTEGER, "1", "" )
+-		SHADER_PARAM( RT_DIVISOR, SHADER_PARAM_TYPE_INTEGER, "2", "trace resolution divisor" )
+-		SHADER_PARAM( RT_MODE, SHADER_PARAM_TYPE_INTEGER, "1", "0 = capture depth, 1 = trace and composite" )
+-		SHADER_PARAM( RT_AORAYS, SHADER_PARAM_TYPE_INTEGER, "2", "AO rays per pixel per frame" )
+-		SHADER_PARAM( RT_ASYNC, SHADER_PARAM_TYPE_INTEGER, "1", "Trace with two frames of latency" )
+-		SHADER_PARAM( RT_COHERENT, SHADER_PARAM_TYPE_INTEGER, "1", "Share ray directions across 2x2 pixel blocks" )
+-		SHADER_PARAM( RT_BUDGET, SHADER_PARAM_TYPE_FLOAT, "7", "GPU budget per traced frame in ms" )
+-	END_SHADER_PARAMS
+-
+-	SHADER_INIT_PARAMS()
+-	{
+-	}
+-
+-	SHADER_INIT
+-	{
+-	}
+-
+-	SHADER_FALLBACK
+-	{
+-		return 0;
+-	}
+-
+-	SHADER_DRAW
+-	{
+-		SHADOW_STATE
+-		{
+-			// A real shader pair must be bound or the (unimplemented) fixed-function
+-			// transform path is used; colour writes are off so the quad itself draws nothing.
+-			pShaderShadow->EnableDepthWrites( false );
+-			pShaderShadow->EnableColorWrites( false );
+-			pShaderShadow->EnableAlphaWrites( false );
+-			pShaderShadow->VertexShaderVertexFormat( VERTEX_POSITION, 1, 0, 0 );
+-			DECLARE_STATIC_VERTEX_SHADER( screenspaceeffect_vs20 );
+-			SET_STATIC_VERTEX_SHADER( screenspaceeffect_vs20 );
+-			if ( g_pHardwareConfig->SupportsPixelShaders_2_b() )
+-			{
+-				DECLARE_STATIC_PIXEL_SHADER( bloom_ps20b );
+-				SET_STATIC_PIXEL_SHADER( bloom_ps20b );
+-			}
+-			else
+-			{
+-				DECLARE_STATIC_PIXEL_SHADER( bloom_ps20 );
+-				SET_STATIC_PIXEL_SHADER( bloom_ps20 );
+-			}
+-		}
+-		DYNAMIC_STATE
+-		{
+-			DECLARE_DYNAMIC_VERTEX_SHADER( screenspaceeffect_vs20 );
+-			SET_DYNAMIC_VERTEX_SHADER( screenspaceeffect_vs20 );
+-			if ( g_pHardwareConfig->SupportsPixelShaders_2_b() )
+-			{
+-				DECLARE_DYNAMIC_PIXEL_SHADER( bloom_ps20b );
+-				SET_DYNAMIC_PIXEL_SHADER( bloom_ps20b );
+-			}
+-			else
+-			{
+-				DECLARE_DYNAMIC_PIXEL_SHADER( bloom_ps20 );
+-				SET_DYNAMIC_PIXEL_SHADER( bloom_ps20 );
+-			}
+-			IRayTracer *pRT = GetRayTracer();
+-			if ( pRT && params[RT_MODE]->GetIntValue() == 0 )
+-			{
+-				pRT->CaptureDepth( params[RT_DIVISOR]->GetIntValue() );
+-			}
+-			else if ( pRT )
+-			{
+-				RTFrameParams fp;
+-				memset( &fp, 0, sizeof( fp ) );
+-				const VMatrix &w2p = params[RT_WORLDTOPROJ]->GetMatrixValue();
+-				const VMatrix &p2w = params[RT_PROJTOWORLD]->GetMatrixValue();
+-				memcpy( fp.m_worldToProjection, w2p.Base(), sizeof( fp.m_worldToProjection ) );
+-				memcpy( fp.m_projectionToWorld, p2w.Base(), sizeof( fp.m_projectionToWorld ) );
+-				params[RT_CAMERAPOS]->GetVecValue( fp.m_cameraPos, 3 );
+-				params[RT_SUNDIR]->GetVecValue( fp.m_sunDir, 3 );
+-				fp.m_flAORadius = params[RT_AORADIUS]->GetFloatValue();
+-				fp.m_flAOStrength = params[RT_AOSTRENGTH]->GetFloatValue();
+-				fp.m_flShadowStrength = params[RT_SHADOWSTRENGTH]->GetFloatValue();
+-				fp.m_flSunAngleDeg = params[RT_SUNANGLE]->GetFloatValue();
+-				fp.m_nFrame = params[RT_FRAME]->GetIntValue();
+-				fp.m_nDebugMode = params[RT_DEBUG]->GetIntValue();
+-				fp.m_bAO = params[RT_AO]->GetIntValue();
+-				fp.m_bShadows = params[RT_SHADOWS]->GetIntValue();
+-				fp.m_nResolutionDivisor = params[RT_DIVISOR]->GetIntValue();
+-				fp.m_nAORays = params[RT_AORAYS]->GetIntValue();
+-				fp.m_bAsync = params[RT_ASYNC]->GetIntValue();
+-				fp.m_bCoherent = params[RT_COHERENT]->GetIntValue();
+-				fp.m_flBudgetMs = params[RT_BUDGET]->GetFloatValue();
+-				pRT->ApplyAndComposite( fp );
+-			}
+-		}
+-		Draw();
+-	}
+-END_SHADER
+diff --git a/materialsystem/stdshaders/wscript b/materialsystem/stdshaders/wscript
+index 737fd96..4d82e51 100644
+--- a/materialsystem/stdshaders/wscript
++++ b/materialsystem/stdshaders/wscript
+@@ -90,7 +90,6 @@ def build(bld):
+ 		'sample4x4.cpp',
+ 		'sample4x4_blend.cpp',
+ 		'screenspace_general.cpp',
+-		'raytracecomposite.cpp',
+ 		'sfm_blurfilterx.cpp',
+ 		'sfm_blurfiltery.cpp',
+ 		'sfm_downsample.cpp',
+-- 
+2.55.0
+

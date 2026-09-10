@@ -1,7 +1,7 @@
 From 4262440b6ec87b1ebe9fe23737b567986b8b6d77 Mon Sep 17 00:00:00 2001
 From: Guy Lyons <guylyons2@gmail.com>
 Date: Wed, 9 Sep 2026 19:49:51 -0400
-Subject: [PATCH 05/11] macos-arm64: ray-traced lighting layer (Metal)
+Subject: [PATCH 05/12] macos-arm64: ray-traced lighting layer (Metal)
 
 - rtmetal: Metal ray tracing module (BVH of world geometry, AO and sun
   shadow rays, temporal accumulation, depth-aware blur, composite kernel).

@@ -1,7 +1,7 @@
 From 0f2f01c794d6591b32ce212fb66cdc0b7b1ef978 Mon Sep 17 00:00:00 2001
 From: Guy Lyons <guylyons2@gmail.com>
 Date: Thu, 10 Sep 2026 00:22:59 -0400
-Subject: [PATCH 10/11] macos-arm64: RT image quality: bilateral upsample, R2
+Subject: [PATCH 10/12] macos-arm64: RT image quality: bilateral upsample, R2
  sampling, adaptive blur
 
 Depth-weighted bilinear upsample in the reprojecting composite instead of
