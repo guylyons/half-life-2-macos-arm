@@ -1,0 +1,40 @@
+// Half-Life 2: Episode One mod directory for the arm64 build.
+// @STEAM_HL2@ is replaced by the launcher with the Steam "Half-Life 2" directory.
+// This directory (|gameinfo_path|) is the only writable path; Steam data is read in place.
+"GameInfo"
+{
+	game		"HALF-LIFE 2"
+	title		"HALF-LIFE'"
+	title2		"== episode one=="
+	type		singleplayer_only
+	nodifficulty	0
+	hasportals	0
+	nocrosshair	0
+	icon		"resource/game"
+
+	FileSystem
+	{
+		SteamAppId	380
+		SearchPaths
+		{
+			game+mod		|gameinfo_path|custom/*
+
+			game+mod		"@STEAM_HL2@/episodic/ep1_pak.vpk"
+			game			"@STEAM_HL2@/hl2/hl2_sound_vo_english.vpk"
+			game			"@STEAM_HL2@/hl2/hl2_pak.vpk"
+			game			"@STEAM_HL2@/hl2/hl2_textures.vpk"
+			game			"@STEAM_HL2@/hl2/hl2_sound_misc.vpk"
+			game			"@STEAM_HL2@/hl2/hl2_misc.vpk"
+			platform		"@STEAM_HL2@/platform/platform_misc.vpk"
+
+			mod+mod_write+default_write_path	|gameinfo_path|.
+			game+game_write		|gameinfo_path|.
+			gamebin			"@APP_GAMEBIN@"	// episodic game libraries (HL2_EPISODIC)
+
+			// "mod" as well as "game": the New Game dialog lists chapter files on the MOD path
+			game+mod		"@STEAM_HL2@/episodic"
+			game			"@STEAM_HL2@/hl2"
+			platform		"@STEAM_HL2@/platform"
+		}
+	}
+}

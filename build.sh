@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the arm64 Source engine and assemble Half-Life 2.app.
-# Usage: ./build.sh [deps|patch|configure|build|install|app]...  (default: all)
+# Usage: ./build.sh [deps|patch|configure|build|install|episodic|app]...  (default: all)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 ENGINE="$ROOT/source-engine"
@@ -43,5 +43,21 @@ build() { cd "$ENGINE" && "$PYTHON" waf build -j"$JOBS"; }
 install() { cd "$ENGINE" && rm -rf "$STAGE" && "$PYTHON" waf install; }
 app() { "$ROOT/make-app.sh"; }
 
-if [ $# -eq 0 ]; then set -- deps patch configure build install app; fi
+# Episode One/Two use the same engine with game libraries compiled as "episodic"
+# (HL2_EPISODIC). They are built in a second waf output directory; only the client
+# and server libraries are taken from it, into stage-episodic/bin (install wipes
+# stage/). The default configuration is restored afterwards.
+episodic() {
+  cd "$ENGINE"
+  # waf keeps one lock file per source tree pointing at the current output directory;
+  # save and restore it so the default build directory does not need reconfiguring.
+  [ -f .lock-waf_darwin_build ] && cp .lock-waf_darwin_build .lock-waf_darwin_build.hl2
+  "$PYTHON" waf configure -o build-episodic -T release --prefix="$STAGE" --build-games=episodic
+  "$PYTHON" waf build -j"$JOBS" --targets=client,server
+  mkdir -p "$ROOT/stage-episodic/bin"
+  cp build-episodic/game/client/libclient.dylib build-episodic/game/server/libserver.dylib "$ROOT/stage-episodic/bin/"
+  [ -f .lock-waf_darwin_build.hl2 ] && mv .lock-waf_darwin_build.hl2 .lock-waf_darwin_build
+}
+
+if [ $# -eq 0 ]; then set -- deps patch configure build install episodic app; fi
 for step in "$@"; do "$step"; done

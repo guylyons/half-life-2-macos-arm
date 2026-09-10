@@ -1,6 +1,5 @@
 source-engine/
 stage/
-Half-Life 2.app/
 *.log
 *.png
 *.jpg
@@ -12,3 +11,6 @@ Half-Life 2.app/
 /spike/interop_bench
 /*.txt
 testbase/
+stage-episodic/
+*.app/
+!/gameinfo.*.txt
