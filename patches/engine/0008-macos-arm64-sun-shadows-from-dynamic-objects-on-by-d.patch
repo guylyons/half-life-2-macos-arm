@@ -1,7 +1,7 @@
 From b20720d6fbd703d46cda8e542935ee1cdfd99c16 Mon Sep 17 00:00:00 2001
 From: Guy Lyons <guylyons2@gmail.com>
 Date: Wed, 9 Sep 2026 23:58:55 -0400
-Subject: [PATCH 08/10] macos-arm64: sun shadows from dynamic objects, on by
+Subject: [PATCH 08/11] macos-arm64: sun shadows from dynamic objects, on by
  default
 
 The sun direction now follows vrad's construction (SetupLightNormalFromProps,

@@ -1,0 +1,186 @@
+From e9488c6286ec9dab3094aa2fb22ef3ce5e452f45 Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Thu, 10 Sep 2026 01:38:11 -0400
+Subject: [PATCH 11/11] macos-arm64: RT cost control: coherent ray blocks, GPU
+ budget, 64-unit AO radius
+
+Enclosed scenes (tunnels, corridors) cost up to 3x the open-air trace on the
+software tracer because every divergent ray walks to a nearby hit. AO
+directions are now shared across 2x2 pixel blocks (rt_coherent, ~25% cheaper,
+the temporal sequence still varies per frame), the default AO radius is 64
+units, and a budget controller (rt_budget, 7 ms) drops to one AO ray per pixel
+while the tracer's smoothed GPU time is over budget. The canal tunnel goes from
+15 ms to 6 ms per traced frame.
+---
+ game/client/rt_layer.cpp                      |  6 +++-
+ .../stdshaders/raytracecomposite.cpp          |  4 +++
+ public/rtmetal/iraytracer.h                   |  2 ++
+ rtmetal/rtmetal.mm                            | 30 ++++++++++++++-----
+ 4 files changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/game/client/rt_layer.cpp b/game/client/rt_layer.cpp
+index f489edd..5018dd4 100644
+--- a/game/client/rt_layer.cpp
++++ b/game/client/rt_layer.cpp
+@@ -36,7 +36,7 @@
+ static ConVar rt_enable( "rt_enable", "1", FCVAR_ARCHIVE, "Ray-traced lighting layer (ambient occlusion and sun shadows)." );
+ static ConVar rt_ao( "rt_ao", "1", FCVAR_ARCHIVE, "Ray-traced ambient occlusion." );
+ static ConVar rt_shadows( "rt_shadows", "1", FCVAR_ARCHIVE, "Ray-traced sun shadows from dynamic objects (NPCs, physics props, doors) onto sunlit surfaces." );
+-static ConVar rt_ao_radius( "rt_ao_radius", "96", FCVAR_ARCHIVE, "AO ray length in world units." );
++static ConVar rt_ao_radius( "rt_ao_radius", "64", FCVAR_ARCHIVE, "AO ray length in world units." );
+ static ConVar rt_ao_strength( "rt_ao_strength", "0.8", FCVAR_ARCHIVE, "AO darkening, 0..1." );
+ static ConVar rt_shadow_strength( "rt_shadow_strength", "0.7", FCVAR_ARCHIVE, "Sun shadow darkening, 0..1." );
+ static ConVar rt_sun_angle( "rt_sun_angle", "1.0", FCVAR_ARCHIVE, "Sun angular radius in degrees (soft shadows)." );
+@@ -46,6 +46,8 @@ static ConVar rt_static_props( "rt_static_props", "1", FCVAR_ARCHIVE, "Include s
+ static ConVar rt_dynamic( "rt_dynamic", "2", FCVAR_ARCHIVE, "Dynamic objects in the ray-traced geometry: 0 none, 1 rigid only (physics props, doors, brush entities), 2 also skinned (NPCs, ragdolls)." );
+ static ConVar rt_dynamic_range( "rt_dynamic_range", "3000", FCVAR_ARCHIVE, "Dynamic objects further than this from the camera are left out." );
+ static ConVar rt_async( "rt_async", "1", FCVAR_ARCHIVE, "Trace with two frames of latency so the GPU never stalls (results are reprojected to the current view). 0 = synchronous." );
++static ConVar rt_coherent( "rt_coherent", "1", FCVAR_ARCHIVE, "Share AO ray directions across 2x2 pixel blocks (faster on software ray tracing; the temporal filter still varies them per frame)." );
++static ConVar rt_budget( "rt_budget", "7", FCVAR_ARCHIVE, "GPU time budget per traced frame in ms; while the tracer is over it, AO uses one ray per pixel instead of rt_ao_rays. 0 = never reduce." );
+ static ConVar rt_debug( "rt_debug", "0", 0, "0 off, 1 AO, 2 sun shadows, 3 normals, 4 depth, 7 any dynamic sun hit, 8 world sun hit, 9 both." );
+ static ConVar rt_stats( "rt_stats", "0", 0, "Print ray tracing timing to the console periodically." );
+ 
+@@ -706,6 +708,8 @@ void RT_DrawComposite( const CViewSetup &view )
+ 	pVar = pMat->FindVar( "$rt_divisor", &bFound ); if ( bFound ) pVar->SetIntValue( clamp( rt_divisor.GetInt(), 1, 4 ) );
+ 	pVar = pMat->FindVar( "$rt_aorays", &bFound ); if ( bFound ) pVar->SetIntValue( clamp( rt_ao_rays.GetInt(), 1, 8 ) );
+ 	pVar = pMat->FindVar( "$rt_async", &bFound ); if ( bFound ) pVar->SetIntValue( rt_async.GetInt() );
++	pVar = pMat->FindVar( "$rt_coherent", &bFound ); if ( bFound ) pVar->SetIntValue( rt_coherent.GetInt() );
++	pVar = pMat->FindVar( "$rt_budget", &bFound ); if ( bFound ) pVar->SetFloatValue( rt_budget.GetFloat() );
+ 	CMatRenderContextPtr pRenderContext( materials );
+ 	pRenderContext->DrawScreenSpaceQuad( pMat );
+ 
+diff --git a/materialsystem/stdshaders/raytracecomposite.cpp b/materialsystem/stdshaders/raytracecomposite.cpp
+index ec0cc16..f307ffb 100644
+--- a/materialsystem/stdshaders/raytracecomposite.cpp
++++ b/materialsystem/stdshaders/raytracecomposite.cpp
+@@ -55,6 +55,8 @@ BEGIN_VS_SHADER_FLAGS( RayTraceComposite, "Ray tracing layer composite", SHADER_
+ 		SHADER_PARAM( RT_MODE, SHADER_PARAM_TYPE_INTEGER, "1", "0 = capture depth, 1 = trace and composite" )
+ 		SHADER_PARAM( RT_AORAYS, SHADER_PARAM_TYPE_INTEGER, "2", "AO rays per pixel per frame" )
+ 		SHADER_PARAM( RT_ASYNC, SHADER_PARAM_TYPE_INTEGER, "1", "Trace with two frames of latency" )
++		SHADER_PARAM( RT_COHERENT, SHADER_PARAM_TYPE_INTEGER, "1", "Share ray directions across 2x2 pixel blocks" )
++		SHADER_PARAM( RT_BUDGET, SHADER_PARAM_TYPE_FLOAT, "7", "GPU budget per traced frame in ms" )
+ 	END_SHADER_PARAMS
+ 
+ 	SHADER_INIT_PARAMS()
+@@ -133,6 +135,8 @@ BEGIN_VS_SHADER_FLAGS( RayTraceComposite, "Ray tracing layer composite", SHADER_
+ 				fp.m_nResolutionDivisor = params[RT_DIVISOR]->GetIntValue();
+ 				fp.m_nAORays = params[RT_AORAYS]->GetIntValue();
+ 				fp.m_bAsync = params[RT_ASYNC]->GetIntValue();
++				fp.m_bCoherent = params[RT_COHERENT]->GetIntValue();
++				fp.m_flBudgetMs = params[RT_BUDGET]->GetFloatValue();
+ 				pRT->ApplyAndComposite( fp );
+ 			}
+ 		}
+diff --git a/public/rtmetal/iraytracer.h b/public/rtmetal/iraytracer.h
+index 90f2081..9185abe 100644
+--- a/public/rtmetal/iraytracer.h
++++ b/public/rtmetal/iraytracer.h
+@@ -27,6 +27,8 @@ struct RTFrameParams
+ 	int		m_nResolutionDivisor;		// 1 = full, 2 = half (default)
+ 	int		m_nAORays;					// AO rays per pixel per frame
+ 	int		m_bAsync;					// trace with two frames of latency (no GPU stalls); 0 = synchronous
++	int		m_bCoherent;				// share ray directions across 2x2 pixel blocks (faster on the software tracer)
++	float	m_flBudgetMs;				// GPU time budget per traced frame; over it, AO drops to one ray per pixel (0 = off)
+ };
+ 
+ // One dynamic object for a frame: an instance of a mesh created with CreateMesh.
+diff --git a/rtmetal/rtmetal.mm b/rtmetal/rtmetal.mm
+index 85e227d..9a70408 100644
+--- a/rtmetal/rtmetal.mm
++++ b/rtmetal/rtmetal.mm
+@@ -41,7 +41,7 @@ struct Params {
+     float shadowStrength; float sunCosAngle; int frame; int debugMode;
+     int aoEnabled; int shadowEnabled; int fullW; int fullH;
+     int halfW; int halfH; int hasSun; int historyValid;
+-    int aoRays; int staticPropInstance; int numShadowBoxes; int pad2;
++    int aoRays; int staticPropInstance; int numShadowBoxes; int coherentBlocks;
+ };
+ 
+ // does the ray from o along d (d.z > 0 assumed nothing) cross the box? slab test
+@@ -140,7 +140,10 @@ kernel void trace(constant Params& p [[buffer(0)]],
+     uint seed = hash(gid.x * 1973u + gid.y * 9277u + uint(p.frame) * 26699u);
+     // per-pixel R2 sequence: each pixel walks a low-discrepancy sequence over frames from its own
+     // random offset, so the accumulated samples converge faster than white noise
+-    uint pix = hash(gid.x * 7919u + gid.y * 104729u);
++    // Directions are shared by 2x2 pixel blocks (coherent rays traverse the BVH together on the
++    // software tracer); the blocks' offsets differ and the sequence advances every frame.
++    uint2 blk = p.coherentBlocks ? (gid / 2u) : gid;
++    uint pix = hash(blk.x * 7919u + blk.y * 104729u);
+     float2 r2off = float2(float(pix & 0xFFFFu), float(pix >> 16)) / 65536.0;
+ 
+     float ao = 1.0;
+@@ -301,7 +304,7 @@ struct RTParamsGPU
+ 	float shadowStrength; float sunCosAngle; int frame; int debugMode;
+ 	int aoEnabled; int shadowEnabled; int fullW; int fullH;
+ 	int halfW; int halfH; int hasSun; int historyValid;
+-	int aoRays; int staticPropInstance; int numShadowBoxes; int pad2;
++	int aoRays; int staticPropInstance; int numShadowBoxes; int coherentBlocks;
+ };
+ 
+ // A dynamic mesh: rest-pose geometry in model space. Rigid meshes carry a prebuilt BVH;
+@@ -331,7 +334,7 @@ public:
+ 	CRayTracerMetal() : m_bInit( false ), m_bAvailable( false ), m_pDevice( nil ), m_pQueue( nil ), m_pAccel( nil ), m_pPendingAccel( nil ),
+ 		m_nSlotCounter( 0 ), m_bAsync( true ), m_nFullW( 0 ), m_nFullH( 0 ), m_nHalfW( 0 ), m_nHalfH( 0 ), m_nHistoryIndex( 0 ), m_bHistoryValid( false ),
+ 		m_pfnGetBackbufferInfo( NULL ), m_pfnResolveDepth( NULL ), m_pfnResolveDepthAsync( NULL ), m_pfnWaitFence( NULL ), m_pfnComposite( NULL ), m_pfnCompositeReprojected( NULL ), m_bDepthCaptured( false ), m_flTimeResolve( 0 ), m_flTimeMetalWall( 0 ), m_flTimeMetalGPU( 0 ), m_flTimeMetalWait( 0 ), m_flTimeComposite( 0 ), m_nTimedFrames( 0 ),
+-		m_nNextMesh( 1 ), m_nEncodeFrame( -1 ), m_pInstanceDescBuffer( nil ), m_pInstanceScratch( nil ), m_pProbe( nil ), m_pShadowBoxes( nil ), m_nShadowBoxes( 0 ), m_nShadowBoxCapacity( 0 ), m_pInstanceAS( nil ), m_nInstanceCapacity( 0 ), m_nFrameCounter( 0 ), m_nLastInstanceCount( 0 ), m_nLastSkinnedCount( 0 ), m_nStaticPropInstance( -1 ), m_flTimeDynamic( 0 ), m_pSkin( nil ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; memset( m_slots, 0, sizeof( m_slots ) ); }
++		m_nNextMesh( 1 ), m_nEncodeFrame( -1 ), m_pInstanceDescBuffer( nil ), m_pInstanceScratch( nil ), m_pProbe( nil ), m_pShadowBoxes( nil ), m_nShadowBoxes( 0 ), m_nShadowBoxCapacity( 0 ), m_pInstanceAS( nil ), m_nInstanceCapacity( 0 ), m_nFrameCounter( 0 ), m_nLastInstanceCount( 0 ), m_nLastSkinnedCount( 0 ), m_nStaticPropInstance( -1 ), m_flGPUAverage( 0 ), m_bReducedRays( false ), m_flTimeDynamic( 0 ), m_pSkin( nil ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; memset( m_slots, 0, sizeof( m_slots ) ); }
+ 
+ 	virtual bool Init() OVERRIDE;
+ 	virtual bool IsAvailable() OVERRIDE { return m_bAvailable; }
+@@ -386,6 +389,7 @@ private:
+ 	id<MTLAccelerationStructure> m_pInstanceAS;
+ 	int m_nInstanceCapacity;
+ 	int m_nFrameCounter, m_nLastInstanceCount, m_nLastSkinnedCount, m_nStaticPropInstance;
++	double m_flGPUAverage; bool m_bReducedRays;
+ 	double m_flTimeDynamic;
+ 	id<MTLComputePipelineState> m_pSkin;
+ 
+@@ -937,6 +941,15 @@ bool CRayTracerMetal::TraceSlot( FrameSlot_t &slot, bool bWaitForDepth )
+ 		gp.hasSun = sunLen > 0.5f;
+ 		gp.historyValid = m_bHistoryValid;
+ 		gp.aoRays = params.m_nAORays > 0 ? params.m_nAORays : 1;
++		// budget controller: drop to one AO ray per pixel while the tracer runs over its GPU budget
++		if ( params.m_flBudgetMs > 0.0f && m_flGPUAverage > 0.0 )
++		{
++			if ( m_flGPUAverage > params.m_flBudgetMs ) m_bReducedRays = true;
++			else if ( m_flGPUAverage < params.m_flBudgetMs * 0.45 ) m_bReducedRays = false;
++		}
++		else
++			m_bReducedRays = false;
++		if ( m_bReducedRays && gp.aoRays > 1 ) gp.aoRays = 1;
+ 
+ 		double t0 = CFAbsoluteTimeGetCurrent();
+ 		id<MTLTexture> histIn = m_pHistory[m_nHistoryIndex], histOut = m_pHistory[m_nHistoryIndex ^ 1];
+@@ -951,6 +964,7 @@ bool CRayTracerMetal::TraceSlot( FrameSlot_t &slot, bool bWaitForDepth )
+ 		m_flTimeDynamic += ( CFAbsoluteTimeGetCurrent() - tDyn ) * 1000.0;
+ 		gp.staticPropInstance = m_nStaticPropInstance;
+ 		gp.numShadowBoxes = m_nShadowBoxes;
++		gp.coherentBlocks = params.m_bCoherent;
+ 
+ 		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+ 		MTLSize tg = MTLSizeMake( 8, 8, 1 );
+@@ -1013,7 +1027,9 @@ bool CRayTracerMetal::WaitSlot( FrameSlot_t &slot )
+ 		m_bAvailable = false;
+ 		return false;
+ 	}
+-	m_flTimeMetalGPU += ( cb.GPUEndTime - cb.GPUStartTime ) * 1000.0;
++	double flGPU = ( cb.GPUEndTime - cb.GPUStartTime ) * 1000.0;
++	m_flTimeMetalGPU += flGPU;
++	m_flGPUAverage = m_flGPUAverage > 0.0 ? m_flGPUAverage * 0.9 + flGPU * 0.1 : flGPU;
+ 	m_flTimeMetalWait += ( CFAbsoluteTimeGetCurrent() - tw ) * 1000.0;
+ 	if ( slot.params.m_nDebugMode >= 9 && ( slot.params.m_nFrame % 60 ) == 0 )
+ 	{
+@@ -1067,8 +1083,8 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 	m_flTimeComposite += ( CFAbsoluteTimeGetCurrent() - t1 ) * 1000.0;
+ 	if ( ++m_nTimedFrames >= 120 )
+ 	{
+-		snprintf( m_szTiming, sizeof( m_szTiming ), "per frame: depth resolve %.2f ms, metal encode %.2f ms (%.2f ms GPU, %.2f ms waited, %.2f ms dynamic), composite %.2f ms; trace %dx%d %s; %d instances (%d skinned)",
+-			m_flTimeResolve / m_nTimedFrames, m_flTimeMetalWall / m_nTimedFrames, m_flTimeMetalGPU / m_nTimedFrames, m_flTimeMetalWait / m_nTimedFrames, m_flTimeDynamic / m_nTimedFrames, m_flTimeComposite / m_nTimedFrames, m_nHalfW, m_nHalfH, m_bAsync ? "async" : "sync", m_nLastInstanceCount, m_nLastSkinnedCount );
++		snprintf( m_szTiming, sizeof( m_szTiming ), "per frame: depth resolve %.2f ms, metal encode %.2f ms (%.2f ms GPU, %.2f ms waited, %.2f ms dynamic), composite %.2f ms; trace %dx%d %s%s; %d instances (%d skinned)",
++			m_flTimeResolve / m_nTimedFrames, m_flTimeMetalWall / m_nTimedFrames, m_flTimeMetalGPU / m_nTimedFrames, m_flTimeMetalWait / m_nTimedFrames, m_flTimeDynamic / m_nTimedFrames, m_flTimeComposite / m_nTimedFrames, m_nHalfW, m_nHalfH, m_bAsync ? "async" : "sync", m_bReducedRays ? ", over budget: 1 AO ray" : "", m_nLastInstanceCount, m_nLastSkinnedCount );
+ 		m_flTimeResolve = m_flTimeMetalWall = m_flTimeMetalGPU = m_flTimeMetalWait = m_flTimeComposite = m_flTimeDynamic = 0.0; m_nTimedFrames = 0;
+ 	}
+ 	return bOK;
+-- 
+2.55.0
+

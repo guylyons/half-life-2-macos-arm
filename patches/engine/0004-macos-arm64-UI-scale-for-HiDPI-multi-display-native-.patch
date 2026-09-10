@@ -1,7 +1,7 @@
 From 778f74b560ad541085d6cee48e29c4a45bad7956 Mon Sep 17 00:00:00 2001
 From: Guy Lyons <guylyons2@gmail.com>
 Date: Wed, 9 Sep 2026 18:12:42 -0400
-Subject: [PATCH 04/10] macos-arm64: UI scale for HiDPI, multi-display native
+Subject: [PATCH 04/11] macos-arm64: UI scale for HiDPI, multi-display native
  modes
 
 - vgui surface: vgui_scale (0 = auto: render pixels per window point);
