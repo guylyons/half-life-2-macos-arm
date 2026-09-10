@@ -1,7 +1,7 @@
 From 48eac6c3432949a6532093c814c5def73aa549b4 Mon Sep 17 00:00:00 2001
 From: Guy Lyons <guylyons2@gmail.com>
 Date: Thu, 10 Sep 2026 02:11:53 -0400
-Subject: [PATCH 12/13] macos-arm64: RT capture and composite as queued
+Subject: [PATCH 12/14] macos-arm64: RT capture and composite as queued
  render-thread calls
 
 The capture and composite were screen-space quads with a shader whose draw

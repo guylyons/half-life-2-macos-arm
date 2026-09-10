@@ -1,0 +1,370 @@
+From 6d7762cba3d0b534defe037b5cbc931a5dcf92b6 Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Thu, 10 Sep 2026 08:14:06 -0400
+Subject: [PATCH 14/14] macos-arm64: RT flicker fixes
+
+- The view model was drawn after the depth capture, so the layer applied
+  the ground's occlusion and reflections to the gun, sliding over it as it
+  bobbed. Depth is now captured after the view model and its depth range
+  ([0, 0.1] from the engine's depth hack) is left untouched.
+- The budget controller switched reflections and AO quality every 30 frames
+  when the cost hovered around the budget (which it does at 2560x1440), a
+  visible on/off of the lighting. It now needs 60 frames over budget to
+  step down, 10 s under budget to step up, remembers what each level cost,
+  holds off a level that had to be abandoned soon after it came back, and
+  never drops reflections: the last tier traces them at a quarter rate.
+- The trace resolution defaults to automatic (rt_divisor 0): half at
+  1512x982, a third at 2560x1440, so the cost is similar on any display.
+- A frame whose depth resolve has not finished waits for it (rt_fence_wait)
+  or reuses the last result instead of dropping the layer for that frame.
+- Status line reports frames without a composite and fence misses.
+---
+ game/client/rt_layer.cpp    | 10 +++--
+ game/client/viewrender.cpp  | 11 ++---
+ public/rtmetal/iraytracer.h |  1 +
+ rtmetal/rtmetal.mm          | 89 +++++++++++++++++++++++++++----------
+ togl/linuxwin/glmrt.cpp     |  2 +-
+ 5 files changed, 80 insertions(+), 33 deletions(-)
+
+diff --git a/game/client/rt_layer.cpp b/game/client/rt_layer.cpp
+index 3c6421a..e9f6ad1 100644
+--- a/game/client/rt_layer.cpp
++++ b/game/client/rt_layer.cpp
+@@ -43,7 +43,7 @@ static ConVar rt_ao_radius( "rt_ao_radius", "64", FCVAR_ARCHIVE, "AO ray length
+ static ConVar rt_ao_strength( "rt_ao_strength", "0.8", FCVAR_ARCHIVE, "AO darkening, 0..1." );
+ static ConVar rt_shadow_strength( "rt_shadow_strength", "0.7", FCVAR_ARCHIVE, "Sun shadow darkening, 0..1." );
+ static ConVar rt_sun_angle( "rt_sun_angle", "1.0", FCVAR_ARCHIVE, "Sun angular radius in degrees (soft shadows)." );
+-static ConVar rt_divisor( "rt_divisor", "2", FCVAR_ARCHIVE, "Trace resolution divisor (1 = full, 2 = half)." );
++static ConVar rt_divisor( "rt_divisor", "0", FCVAR_ARCHIVE, "Trace resolution divisor: 1 full, 2 half, 3, 4; 0 picks one from the screen size (half at 1512x982, a third at 2560x1440)." );
+ static ConVar rt_ao_rays( "rt_ao_rays", "2", FCVAR_ARCHIVE, "AO rays per pixel per frame." );
+ static ConVar rt_reflections( "rt_reflections", "1", FCVAR_ARCHIVE, "Ray-traced reflections on surfaces with an environment map (metal, tiles, glass). Water keeps the engine's own reflections." );
+ static ConVar rt_reflection_strength( "rt_reflection_strength", "0.7", FCVAR_ARCHIVE, "Scales material reflectivity for ray-traced reflections, 0..1." );
+@@ -54,7 +54,8 @@ static ConVar rt_dynamic( "rt_dynamic", "2", FCVAR_ARCHIVE, "Dynamic objects in
+ static ConVar rt_dynamic_range( "rt_dynamic_range", "3000", FCVAR_ARCHIVE, "Dynamic objects further than this from the camera are left out." );
+ static ConVar rt_async( "rt_async", "1", FCVAR_ARCHIVE, "Trace with two frames of latency so the GPU never stalls (results are reprojected to the current view). 0 = synchronous." );
+ static ConVar rt_coherent( "rt_coherent", "1", FCVAR_ARCHIVE, "Share AO ray directions across 2x2 pixel blocks (faster on software ray tracing; the temporal filter still varies them per frame)." );
+-static ConVar rt_budget( "rt_budget", "7", FCVAR_ARCHIVE, "GPU time budget per traced frame in ms; while the tracer is over it, AO uses one ray per pixel instead of rt_ao_rays. 0 = never reduce." );
++static ConVar rt_budget( "rt_budget", "8", FCVAR_ARCHIVE, "GPU time budget per traced frame in ms; while the tracer is over it, AO uses one ray per pixel instead of rt_ao_rays. 0 = never reduce." );
++static ConVar rt_fence_wait( "rt_fence_wait", "50", FCVAR_ARCHIVE, "Milliseconds to wait for the previous frame's depth copy before tracing it. 0 skips the frame instead, which drops the whole layer for that frame." );
+ static ConVar rt_debug( "rt_debug", "0", 0, "0 off, 1 AO, 2 sun shadows, 3 normals, 4 depth, 5 reflection colour, 6 reflectivity, 7 any dynamic sun hit, 8 world sun hit, 9 both." );
+ static ConVar rt_stats( "rt_stats", "0", 0, "Print ray tracing timing to the console periodically." );
+ 
+@@ -855,7 +856,7 @@ void RT_CaptureDepth()
+ 		return;
+ 	if ( !GetRayTracer() )
+ 		return;
+-	int nDivisor = clamp( rt_divisor.GetInt(), 1, 4 );
++	int nDivisor = clamp( rt_divisor.GetInt(), 0, 4 );
+ 	CMatRenderContextPtr pRenderContext( materials );
+ 	ICallQueue *pCallQueue = pRenderContext->GetCallQueue();
+ 	if ( pCallQueue )
+@@ -896,11 +897,12 @@ void RT_DrawComposite( const CViewSetup &view )
+ 	fp.m_bReflections = rt_reflections.GetInt();
+ 	fp.m_flReflectionStrength = clamp( rt_reflection_strength.GetFloat(), 0.0f, 1.0f );
+ 	sscanf( rt_sky_color.GetString(), "%f %f %f", &fp.m_skyColor[0], &fp.m_skyColor[1], &fp.m_skyColor[2] );
+-	fp.m_nResolutionDivisor = clamp( rt_divisor.GetInt(), 1, 4 );
++	fp.m_nResolutionDivisor = clamp( rt_divisor.GetInt(), 0, 4 );
+ 	fp.m_nAORays = clamp( rt_ao_rays.GetInt(), 1, 8 );
+ 	fp.m_bAsync = rt_async.GetInt();
+ 	fp.m_bCoherent = rt_coherent.GetInt();
+ 	fp.m_flBudgetMs = rt_budget.GetFloat();
++	fp.m_flFenceWaitMs = rt_fence_wait.GetFloat();
+ 
+ 	CMatRenderContextPtr pRenderContext( materials );
+ 	ICallQueue *pCallQueue = pRenderContext->GetCallQueue();
+diff --git a/game/client/viewrender.cpp b/game/client/viewrender.cpp
+index 20c0bc8..d7e5409 100644
+--- a/game/client/viewrender.cpp
++++ b/game/client/viewrender.cpp
+@@ -2017,11 +2017,6 @@ void CViewRender::RenderView( const CViewSetup &view, int nClearFlags, int whatT
+ 		// Finish scene
+ 		render->SceneEnd();
+ 
+-		// ray-traced lighting layer: grab the scene depth before post-processing reuses the depth buffer (macOS arm64 port).
+-		// Only for the player's view: save-game thumbnails and overlay views also come through here.
+-		if ( whatToDraw & RENDERVIEW_DRAWHUD )
+-			RT_CaptureDepth();
+-
+ 		// Draw lightsources if enabled
+ 		render->DrawLights();
+ 
+@@ -2046,6 +2041,12 @@ void CViewRender::RenderView( const CViewSetup &view, int nClearFlags, int whatT
+ 		// Now actually draw the viewmodel
+ 		DrawViewModels( view, whatToDraw & RENDERVIEW_DRAWVIEWMODEL );
+ 
++		// ray-traced lighting layer: grab the scene depth before post-processing reuses the depth buffer (macOS arm64 port).
++		// After the view model, whose depth-range hack puts it in [0, 0.1]: the tracer leaves those pixels alone.
++		// Only for the player's view: save-game thumbnails and overlay views also come through here.
++		if ( whatToDraw & RENDERVIEW_DRAWHUD )
++			RT_CaptureDepth();
++
+ 		DrawUnderwaterOverlay();
+ 
+ 		PixelVisibility_EndScene();
+diff --git a/public/rtmetal/iraytracer.h b/public/rtmetal/iraytracer.h
+index becf688..a4c6b3d 100644
+--- a/public/rtmetal/iraytracer.h
++++ b/public/rtmetal/iraytracer.h
+@@ -32,6 +32,7 @@ struct RTFrameParams
+ 	int		m_bAsync;					// trace with two frames of latency (no GPU stalls); 0 = synchronous
+ 	int		m_bCoherent;				// share ray directions across 2x2 pixel blocks (faster on the software tracer)
+ 	float	m_flBudgetMs;				// GPU time budget per traced frame; over it, AO drops to one ray per pixel (0 = off)
++	float	m_flFenceWaitMs;			// how long to wait for last frame's depth resolve before tracing (0 = never wait, skip the frame)
+ };
+ 
+ // One dynamic object for a frame: an instance of a mesh created with CreateMesh.
+diff --git a/rtmetal/rtmetal.mm b/rtmetal/rtmetal.mm
+index 1826507..0cb48c3 100644
+--- a/rtmetal/rtmetal.mm
++++ b/rtmetal/rtmetal.mm
+@@ -42,7 +42,7 @@ struct Params {
+     int aoEnabled; int shadowEnabled; int fullW; int fullH;
+     int halfW; int halfH; int hasSun; int historyValid;
+     int aoRays; int staticPropInstance; int numShadowBoxes; int coherentBlocks;
+-    int reflections; float reflectionStrength; int pad3; int pad4;
++    int reflections; float reflectionStrength; int reflRate; int pad4;
+     packed_float3 skyColor; float pad5;
+ };
+ 
+@@ -138,13 +138,15 @@ kernel void trace(constant Params& p [[buffer(0)]],
+     int div = p.fullW / p.halfW;
+     int2 px = int2(gid) * div + div / 2;
+     float d = readDepth(depthTex, px, p);
+-    if (d >= 0.99999) { rawTex.write(float4(1, 1, 0, 0), gid); normalTex.write(float4(0,0,0,0), gid); return; }
++    // sky, and the view model (drawn with its depth range squeezed into [0, 0.1])
++    if (d >= 0.99999 || d < 0.1) { rawTex.write(float4(1, 1, 0, 0), gid); normalTex.write(float4(0,0,0,0), gid); return; }
+     float2 uv = (float2(px) + 0.5) / float2(p.fullW, p.fullH);
+     float3 P = reconstruct(p, uv, d);
+     // normal from the depth neighbourhood: pick the neighbour pair with the smaller depth discontinuity
+     float2 texel = float2(div) / float2(p.fullW, p.fullH);
+     float dl = readDepth(depthTex, px - int2(div, 0), p), dr = readDepth(depthTex, px + int2(div, 0), p);
+     float dd = readDepth(depthTex, px - int2(0, div), p), du = readDepth(depthTex, px + int2(0, div), p);
++    if (dl < 0.1) dl = 2.0; if (dr < 0.1) dr = 2.0; if (dd < 0.1) dd = 2.0; if (du < 0.1) du = 2.0;   // never pick a view-model neighbour
+     float3 Px = (abs(dr - d) < abs(dl - d)) ? reconstruct(p, uv + float2(texel.x, 0), dr) - P : P - reconstruct(p, uv - float2(texel.x, 0), dl);
+     float3 Py = (abs(du - d) < abs(dd - d)) ? reconstruct(p, uv + float2(0, texel.y), du) - P : P - reconstruct(p, uv - float2(0, texel.y), dd);
+     float3 N = normalize(cross(Px, Py));
+@@ -255,7 +257,8 @@ kernel void reflect_(constant Params& p [[buffer(0)]],
+ {
+     if (gid.x >= (uint)p.halfW || gid.y >= (uint)p.halfH) return;
+     float4 refl = float4(0.0, 0.0, 0.0, -1.0);
+-    bool traceRefl = (((gid.x + gid.y + uint(p.frame)) & 1u) == 0u);
++    // rate 2: checkerboard alternating per frame; rate 4: one pixel of each 2x2 block per frame, cycling
++    bool traceRefl = p.reflRate >= 4 ? (((gid.x & 1u) + 2u * (gid.y & 1u)) == (uint(p.frame) & 3u)) : (((gid.x + gid.y + uint(p.frame)) & 1u) == 0u);
+     if (!traceRefl) { reflRawTex.write(refl, gid); return; }
+     float4 nrm = normalTex.read(gid);
+     if (nrm.a == 0.0) { reflRawTex.write(float4(0.0), gid); return; }
+@@ -303,7 +306,7 @@ kernel void reflect_(constant Params& p [[buffer(0)]],
+                     float hd = readDepth(depthTex, hp, p);
+                     float hdist = length(float3(p.cameraPos) - reconstruct(p, (float2(hp) + 0.5) / float2(p.fullW, p.fullH), hd));
+                     float hitDist = length(float3(p.cameraPos) - H);
+-                    if (abs(hdist - hitDist) < 0.03 * hitDist + 4.0) {
++                    if (hd >= 0.1 && abs(hdist - hitDist) < 0.03 * hitDist + 4.0) {
+                         constexpr sampler cs(filter::linear, address::clamp_to_edge);
+                         c = colorTex.sample(cs, huv).rgb;
+                         onScreen = true;
+@@ -375,7 +378,7 @@ kernel void temporal(constant Params& p [[buffer(0)]],
+                     // this frame keep the reprojected history
+                     float4 rh = reflHistoryTex.sample(s, puv);
+                     if (!(rh.a >= 0.0 && rh.a <= 1.0)) rh = float4(0.0);	// never accumulated (or NaN)
+-                    float rw = 1.0 / (min(count, 12.0) + 1.0);
++                    float rw = 1.0 / (clamp(count, 4.0, 12.0) + 1.0);   // at least a few frames of blending, or the checkerboard shimmers
+                     reflAcc = reflRaw.a < 0.0 ? rh : mix(rh, reflRaw, rw);
+                 }
+             }
+@@ -444,7 +447,7 @@ struct RTParamsGPU
+ 	int aoEnabled; int shadowEnabled; int fullW; int fullH;
+ 	int halfW; int halfH; int hasSun; int historyValid;
+ 	int aoRays; int staticPropInstance; int numShadowBoxes; int coherentBlocks;
+-	int reflections; float reflectionStrength; int pad3; int pad4;
++	int reflections; float reflectionStrength; int reflRate; int pad4;
+ 	float skyColor[3]; float pad5;
+ };
+ 
+@@ -473,9 +476,9 @@ class CRayTracerMetal : public IRayTracer
+ {
+ public:
+ 	CRayTracerMetal() : m_bInit( false ), m_bAvailable( false ), m_pDevice( nil ), m_pQueue( nil ), m_pAccel( nil ), m_pPendingAccel( nil ),
+-		m_nSlotCounter( 0 ), m_bAsync( true ), m_bReflections( true ), m_nFullW( 0 ), m_nFullH( 0 ), m_nHalfW( 0 ), m_nHalfH( 0 ), m_nHistoryIndex( 0 ), m_bHistoryValid( false ),
+-		m_pfnGetBackbufferInfo( NULL ), m_pfnResolveDepth( NULL ), m_pfnResolveDepthAsync( NULL ), m_pfnWaitFence( NULL ), m_pfnComposite( NULL ), m_pfnCompositeReprojected( NULL ), m_bDepthCaptured( false ), m_flTimeResolve( 0 ), m_flTimeMetalWall( 0 ), m_flTimeMetalGPU( 0 ), m_flTimeMetalWait( 0 ), m_flTimeComposite( 0 ), m_nTimedFrames( 0 ),
+-		m_nNextMesh( 1 ), m_nEncodeFrame( -1 ), m_pInstanceDescBuffer( nil ), m_pInstanceScratch( nil ), m_pProbe( nil ), m_pShadowBoxes( nil ), m_pInstMats( nil ), m_pWorldMats( nil ), m_pPendingWorldMats( nil ), m_nInstMatsCapacity( 0 ), m_nShadowBoxes( 0 ), m_nShadowBoxCapacity( 0 ), m_pInstanceAS( nil ), m_nInstanceCapacity( 0 ), m_nFrameCounter( 0 ), m_nLastInstanceCount( 0 ), m_nLastSkinnedCount( 0 ), m_nStaticPropInstance( -1 ), m_flGPUAverage( 0 ), m_bReducedRays( false ), m_nReduceLevel( 0 ), m_nBudgetCooldown( 0 ), m_flTimeDynamic( 0 ), m_pSkin( nil ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; memset( m_slots, 0, sizeof( m_slots ) ); }
++		m_nSlotCounter( 0 ), m_bAsync( true ), m_bReflections( true ), m_flFenceWaitMs( 50.0f ), m_nFullW( 0 ), m_nFullH( 0 ), m_nHalfW( 0 ), m_nHalfH( 0 ), m_nHistoryIndex( 0 ), m_bHistoryValid( false ),
++		m_pfnGetBackbufferInfo( NULL ), m_pfnResolveDepth( NULL ), m_pfnResolveDepthAsync( NULL ), m_pfnWaitFence( NULL ), m_pfnComposite( NULL ), m_pfnCompositeReprojected( NULL ), m_bDepthCaptured( false ), m_flTimeResolve( 0 ), m_flTimeMetalWall( 0 ), m_flTimeMetalGPU( 0 ), m_flTimeMetalWait( 0 ), m_flTimeComposite( 0 ), m_flTimeFenceWait( 0 ), m_nFenceMisses( 0 ), m_nNoComposite( 0 ), m_nTimedFrames( 0 ),
++		m_nNextMesh( 1 ), m_nEncodeFrame( -1 ), m_pInstanceDescBuffer( nil ), m_pInstanceScratch( nil ), m_pProbe( nil ), m_pShadowBoxes( nil ), m_pInstMats( nil ), m_pWorldMats( nil ), m_pPendingWorldMats( nil ), m_nInstMatsCapacity( 0 ), m_nShadowBoxes( 0 ), m_nShadowBoxCapacity( 0 ), m_pInstanceAS( nil ), m_nInstanceCapacity( 0 ), m_nFrameCounter( 0 ), m_nLastInstanceCount( 0 ), m_nLastSkinnedCount( 0 ), m_nStaticPropInstance( -1 ), m_flGPUAverage( 0 ), m_bReducedRays( false ), m_nReduceLevel( 0 ), m_nBudgetCooldown( 0 ), m_flTimeDynamic( 0 ), m_pSkin( nil ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; memset( m_slots, 0, sizeof( m_slots ) ); m_pLastComposited = NULL; memset( m_flLevelCost, 0, sizeof( m_flLevelCost ) ); memset( m_nLevelHoldoff, 0, sizeof( m_nLevelHoldoff ) ); }
+ 
+ 	virtual bool Init() OVERRIDE;
+ 	virtual bool IsAvailable() OVERRIDE { return m_bAvailable; }
+@@ -502,7 +505,7 @@ public:
+ 	};
+ 	virtual const char *GetStatus() OVERRIDE { snprintf( m_szStatusFull, sizeof( m_szStatusFull ), "%s; %s", m_szStatus, m_szTiming ); return m_szStatusFull; }
+ 	bool m_bDepthCaptured;
+-	double m_flTimeResolve, m_flTimeMetalWall, m_flTimeMetalGPU, m_flTimeMetalWait, m_flTimeComposite; int m_nTimedFrames; char m_szTiming[512]; char m_szStatusFull[800];
++	double m_flTimeResolve, m_flTimeMetalWall, m_flTimeMetalGPU, m_flTimeMetalWait, m_flTimeComposite, m_flTimeFenceWait; int m_nTimedFrames, m_nFenceMisses, m_nNoComposite; char m_szTiming[640]; char m_szStatusFull[1024];
+ 
+ private:
+ 	bool EnsureTargets( int w, int h, int divisor );
+@@ -532,6 +535,7 @@ private:
+ 	int m_nInstanceCapacity;
+ 	int m_nFrameCounter, m_nLastInstanceCount, m_nLastSkinnedCount, m_nStaticPropInstance;
+ 	double m_flGPUAverage; bool m_bReducedRays; int m_nReduceLevel, m_nBudgetCooldown;
++	double m_flLevelCost[3]; int m_nLevelHoldoff[3];
+ 	double m_flTimeDynamic;
+ 	id<MTLComputePipelineState> m_pSkin;
+ 
+@@ -543,8 +547,10 @@ private:
+ 	id<MTLAccelerationStructure> m_pAccel, m_pPendingAccel;
+ 	id<MTLBuffer> m_pVertexBuffer, m_pIndexBuffer;	// keep alive while the structure references them
+ 	FrameSlot_t m_slots[3];
++	FrameSlot_t *m_pLastComposited;
+ 	int m_nSlotCounter;			// increments per CaptureDepth
+ 	bool m_bAsync, m_bReflections;
++	float m_flFenceWaitMs;
+ 	id<MTLTexture> m_pRawTex, m_pHistory[2], m_pReflRawTex, m_pReflHistory[2];
+ 	int m_nFullW, m_nFullH, m_nHalfW, m_nHalfH, m_nHistoryIndex;
+ 	bool m_bHistoryValid;
+@@ -980,6 +986,7 @@ static id<MTLTexture> MakeTex( id<MTLDevice> dev, MTLPixelFormat fmt, int w, int
+ 
+ void CRayTracerMetal::ReleaseSlots()
+ {
++	m_pLastComposited = NULL;
+ 	for ( int i = 0; i < 3; i++ )
+ 	{
+ 		FrameSlot_t &sl = m_slots[i];
+@@ -1049,7 +1056,14 @@ bool CRayTracerMetal::CaptureDepth( int nResolutionDivisor )
+ 	int w = 0, h = 0, msaa = 0;
+ 	if ( !m_pfnGetBackbufferInfo( &w, &h, &msaa ) || w <= 0 || h <= 0 )
+ 		return false;
+-	int divisor = nResolutionDivisor >= 1 ? nResolutionDivisor : 2;
++	int divisor = nResolutionDivisor;
++	if ( divisor < 1 )
++	{
++		// automatic: the smallest divisor that keeps the trace under ~400k pixels (half resolution at
++		// 1512x982, a third at 2560x1440, a quarter at 4K), so the cost is about the same on any display
++		divisor = 2;
++		while ( ( w / divisor ) * ( h / divisor ) > 420000 && divisor < 4 ) divisor++;
++	}
+ 	if ( !EnsureTargets( w, h, divisor ) )
+ 		return false;
+ 	FrameSlot_t &sl = m_slots[( m_nSlotCounter + 1 ) % 3];
+@@ -1077,8 +1091,16 @@ bool CRayTracerMetal::TraceSlot( FrameSlot_t &slot, bool bWaitForDepth )
+ 		return false;
+ 	if ( slot.pFence )
+ 	{
+-		if ( !m_pfnWaitFence( slot.pFence, bWaitForDepth ? 2000000000ull : 0 ) )
++		// The resolve was issued a frame ago and is almost always done. If the GPU is behind, wait
++		// (bounded): skipping the frame would drop the whole layer for a frame, which flickers.
++		double tw = CFAbsoluteTimeGetCurrent();
++		bool bOK = m_pfnWaitFence( slot.pFence, bWaitForDepth ? 2000000000ull : (unsigned long long)( m_flFenceWaitMs * 1000000.0f ) );
++		m_flTimeFenceWait += ( CFAbsoluteTimeGetCurrent() - tw ) * 1000.0;
++		if ( !bOK )
++		{
++			m_nFenceMisses++;
+ 			return false;
++		}
+ 		slot.pFence = NULL;
+ 	}
+ 	{
+@@ -1117,22 +1139,38 @@ bool CRayTracerMetal::TraceSlot( FrameSlot_t &slot, bool bWaitForDepth )
+ 		gp.hasSun = sunLen > 0.5f;
+ 		gp.historyValid = m_bHistoryValid;
+ 		gp.aoRays = params.m_nAORays > 0 ? params.m_nAORays : 1;
+-		// budget controller: while the tracer runs over its GPU budget, first drop to one AO ray per
+-		// pixel, then drop reflections; re-enable in the reverse order once well under budget.
+-		// Decisions are spaced out so the average can settle.
++		// Budget controller: while the tracer runs over its GPU budget, first drop to one AO ray per
++		// pixel, then drop reflections. Quality comes back only slowly, and only when the cost last
++		// seen at that level fitted comfortably; a level that had to be abandoned soon after it was
++		// restored is not tried again for a minute. Anything faster reads as lighting flickering.
+ 		if ( params.m_flBudgetMs > 0.0f && m_flGPUAverage > 0.0 )
+ 		{
+-			if ( ++m_nBudgetCooldown >= 30 )
++			// remember what each level cost (ignoring the first seconds after a map load, when everything is slow)
++			if ( m_nFrameCounter > 300 )
++				m_flLevelCost[m_nReduceLevel] = m_flLevelCost[m_nReduceLevel] > 0.0 ? m_flLevelCost[m_nReduceLevel] * 0.95 + m_flGPUAverage * 0.05 : m_flGPUAverage;
++			m_nBudgetCooldown++;
++			// a level's remembered cost goes stale: after 20 s at a lower level, try it again on the current cost
++			if ( m_nBudgetCooldown == 1200 && m_nReduceLevel > 0 ) m_flLevelCost[m_nReduceLevel - 1] = 0.0;
++			if ( m_flGPUAverage > params.m_flBudgetMs * 1.15 && m_nReduceLevel < 2 && m_nBudgetCooldown >= 60 )
++			{
++				// had we just restored this level? then it is unstable: hold off for a minute
++				if ( m_nBudgetCooldown < 600 ) m_nLevelHoldoff[m_nReduceLevel] = m_nFrameCounter + 3600;
++				m_nReduceLevel++; m_nBudgetCooldown = 0;
++			}
++			else if ( m_nReduceLevel > 0 && m_nBudgetCooldown >= 600 && m_nFrameCounter > m_nLevelHoldoff[m_nReduceLevel - 1] )
+ 			{
+-				if ( m_flGPUAverage > params.m_flBudgetMs && m_nReduceLevel < 2 ) { m_nReduceLevel++; m_nBudgetCooldown = 0; }
+-				else if ( m_flGPUAverage * 1.5 < params.m_flBudgetMs && m_nReduceLevel > 0 ) { m_nReduceLevel--; m_nBudgetCooldown = 0; }	// the next level up costs roughly half as much again
++				double flKnown = m_flLevelCost[m_nReduceLevel - 1];
++				bool bFits = flKnown > 0.0 ? ( flKnown < params.m_flBudgetMs * 0.8 ) : ( m_flGPUAverage * 1.6 < params.m_flBudgetMs );
++				if ( bFits ) { m_nReduceLevel--; m_nBudgetCooldown = 0; }
+ 			}
+ 		}
+ 		else
+ 			m_nReduceLevel = 0;
+ 		m_bReducedRays = m_nReduceLevel >= 1;
+ 		if ( m_bReducedRays && gp.aoRays > 1 ) gp.aoRays = 1;
+-		if ( m_nReduceLevel >= 2 ) gp.reflections = 0;
++		// level 2 traces reflections at a quarter rate instead of dropping them: the history covers the
++		// gap, so nothing switches on screen
++		gp.reflRate = m_nReduceLevel >= 2 ? 4 : 2;
+ 
+ 		double t0 = CFAbsoluteTimeGetCurrent();
+ 		id<MTLTexture> histIn = m_pHistory[m_nHistoryIndex], histOut = m_pHistory[m_nHistoryIndex ^ 1];
+@@ -1149,7 +1187,7 @@ bool CRayTracerMetal::TraceSlot( FrameSlot_t &slot, bool bWaitForDepth )
+ 		gp.staticPropInstance = m_nStaticPropInstance;
+ 		gp.numShadowBoxes = m_nShadowBoxes;
+ 		gp.coherentBlocks = params.m_bCoherent;
+-		gp.reflections = params.m_bReflections && m_nReduceLevel < 2;
++		gp.reflections = params.m_bReflections;
+ 		gp.reflectionStrength = params.m_flReflectionStrength;
+ 		memcpy( gp.skyColor, params.m_skyColor, sizeof( gp.skyColor ) );
+ 
+@@ -1258,6 +1296,7 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 	m_bDepthCaptured = false;
+ 	m_bAsync = params.m_bAsync != 0;
+ 	m_bReflections = params.m_bReflections != 0;
++	m_flFenceWaitMs = params.m_flFenceWaitMs;
+ 	// the slot captured this frame gets this frame's camera
+ 	FrameSlot_t &cur = m_slots[m_nSlotCounter % 3];
+ 	cur.params = params;
+@@ -1274,6 +1313,9 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 			pComposite = &older;
+ 		else if ( prev.bTraced && prev.cb == nil )
+ 			pComposite = &prev;
++		else if ( m_pLastComposited && m_pLastComposited->bTraced && m_pLastComposited->cb == nil )
++			pComposite = m_pLastComposited;	// nothing new: reproject the last result rather than drop the layer for a frame
++		if ( pComposite ) m_pLastComposited = pComposite;
+ 	}
+ 	else
+ 	{
+@@ -1292,11 +1334,12 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 			params.m_flAOStrength, params.m_flShadowStrength, params.m_nDebugMode );
+ 	}
+ 	m_flTimeComposite += ( CFAbsoluteTimeGetCurrent() - t1 ) * 1000.0;
++	if ( !pComposite ) m_nNoComposite++;
+ 	if ( ++m_nTimedFrames >= 120 )
+ 	{
+-		snprintf( m_szTiming, sizeof( m_szTiming ), "per frame: depth resolve %.2f ms, metal encode %.2f ms (%.2f ms GPU, %.2f ms waited, %.2f ms dynamic), composite %.2f ms; trace %dx%d %s%s; %d instances (%d skinned)",
+-			m_flTimeResolve / m_nTimedFrames, m_flTimeMetalWall / m_nTimedFrames, m_flTimeMetalGPU / m_nTimedFrames, m_flTimeMetalWait / m_nTimedFrames, m_flTimeDynamic / m_nTimedFrames, m_flTimeComposite / m_nTimedFrames, m_nHalfW, m_nHalfH, m_bAsync ? "async" : "sync", m_nReduceLevel >= 2 ? ", over budget: 1 AO ray, no reflections" : ( m_bReducedRays ? ", over budget: 1 AO ray" : "" ), m_nLastInstanceCount, m_nLastSkinnedCount );
+-		m_flTimeResolve = m_flTimeMetalWall = m_flTimeMetalGPU = m_flTimeMetalWait = m_flTimeComposite = m_flTimeDynamic = 0.0; m_nTimedFrames = 0;
++		snprintf( m_szTiming, sizeof( m_szTiming ), "per frame: depth resolve %.2f ms, metal encode %.2f ms (%.2f ms GPU, %.2f ms waited, %.2f ms fence, %.2f ms dynamic), composite %.2f ms; trace %dx%d %s%s; %d instances (%d skinned); %d frames without composite, %d fence misses",
++			m_flTimeResolve / m_nTimedFrames, m_flTimeMetalWall / m_nTimedFrames, m_flTimeMetalGPU / m_nTimedFrames, m_flTimeMetalWait / m_nTimedFrames, m_flTimeFenceWait / m_nTimedFrames, m_flTimeDynamic / m_nTimedFrames, m_flTimeComposite / m_nTimedFrames, m_nHalfW, m_nHalfH, m_bAsync ? "async" : "sync", m_nReduceLevel >= 2 ? ", over budget: 1 AO ray, quarter-rate reflections" : ( m_bReducedRays ? ", over budget: 1 AO ray" : "" ), m_nLastInstanceCount, m_nLastSkinnedCount, m_nNoComposite, m_nFenceMisses );
++		m_flTimeResolve = m_flTimeMetalWall = m_flTimeMetalGPU = m_flTimeMetalWait = m_flTimeComposite = m_flTimeDynamic = m_flTimeFenceWait = 0.0; m_nTimedFrames = 0; m_nNoComposite = 0; m_nFenceMisses = 0;
+ 	}
+ 	return bOK;
+ }
+diff --git a/togl/linuxwin/glmrt.cpp b/togl/linuxwin/glmrt.cpp
+index eddd312..7173331 100644
+--- a/togl/linuxwin/glmrt.cpp
++++ b/togl/linuxwin/glmrt.cpp
+@@ -122,7 +122,7 @@ static const char *s_pReprojectFragmentShader =
+ 	"uniform int debugMode;\n"
+ 	"void main() {\n"
+ 	"  float d = texture2D( depthTex, uv ).r;\n"
+-	"  if ( d >= 0.99999 ) { gl_FragColor = ( debugMode != 0 || pass == 1 ) ? vec4( 0.0, 0.0, 0.0, 1.0 ) : vec4( 1.0 ); return; }\n"
++	"  if ( d >= 0.99999 || d < 0.1 ) { gl_FragColor = ( debugMode != 0 || pass == 1 ) ? vec4( 0.0, 0.0, 0.0, 1.0 ) : vec4( 1.0 ); return; }\n"   // sky, or the view model
+ 	"  vec4 w = projToWorld * vec4( uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0 );\n"
+ 	"  vec3 P = w.xyz / w.w;\n"
+ 	"  float dist = length( cameraPos - P );\n"
+-- 
+2.55.0
+

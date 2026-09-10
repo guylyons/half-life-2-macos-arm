@@ -1,7 +1,7 @@
 From 740b5282aa29d2ac65095290304f359f8be00c0e Mon Sep 17 00:00:00 2001
 From: Guy Lyons <guylyons2@gmail.com>
 Date: Thu, 10 Sep 2026 00:18:10 -0400
-Subject: [PATCH 09/13] macos-arm64: asynchronous ray tracing with reprojected
+Subject: [PATCH 09/14] macos-arm64: asynchronous ray tracing with reprojected
  composite
 
 The depth captured at frame N is traced at N+1 (after a GL fence, never a

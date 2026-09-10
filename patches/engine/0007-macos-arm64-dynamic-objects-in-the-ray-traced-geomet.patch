@@ -1,7 +1,7 @@
 From 0414e0a0bfbf7445a8dbabe591f567afbceb1cd7 Mon Sep 17 00:00:00 2001
 From: Guy Lyons <guylyons2@gmail.com>
 Date: Wed, 9 Sep 2026 23:16:33 -0400
-Subject: [PATCH 07/13] macos-arm64: dynamic objects in the ray-traced geometry
+Subject: [PATCH 07/14] macos-arm64: dynamic objects in the ray-traced geometry
 
 Two-level acceleration structure: the static world (brushes + static props)
 plus per-frame instances. Rigid meshes (physics props, doors, brush
