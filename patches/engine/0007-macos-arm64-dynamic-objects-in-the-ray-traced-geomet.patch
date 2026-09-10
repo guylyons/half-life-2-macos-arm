@@ -1,0 +1,953 @@
+From 0414e0a0bfbf7445a8dbabe591f567afbceb1cd7 Mon Sep 17 00:00:00 2001
+From: Guy Lyons <guylyons2@gmail.com>
+Date: Wed, 9 Sep 2026 23:16:33 -0400
+Subject: [PATCH 7/7] macos-arm64: dynamic objects in the ray-traced geometry
+
+Two-level acceleration structure: the static world (brushes + static props)
+plus per-frame instances. Rigid meshes (physics props, doors, brush
+entities) carry a prebuilt BVH and are instanced with the entity
+transform; skinned models (NPCs, ragdolls) are skinned on the GPU from the
+client's bone matrices into a per-object world-space copy that is refitted
+each frame. The temporal pass clips history against the 3x3 neighbourhood
+so occlusion from moving objects does not trail. Bounded GPU wait: a hang or
+fault disables the layer instead of freezing the game.
+
+rt_dynamic 0/1/2 (none / rigid only / rigid + skinned), rt_dynamic_range,
+rt_list_dynamic.
+---
+ game/client/rt_layer.cpp    | 209 +++++++++++++++++-
+ public/rtmetal/iraytracer.h |  22 +-
+ rtmetal/rtmetal.mm          | 427 +++++++++++++++++++++++++++++++++---
+ 3 files changed, 616 insertions(+), 42 deletions(-)
+
+diff --git a/game/client/rt_layer.cpp b/game/client/rt_layer.cpp
+index 8765db5..4de4b38 100644
+--- a/game/client/rt_layer.cpp
++++ b/game/client/rt_layer.cpp
+@@ -26,6 +26,8 @@
+ #include "datacache/imdlcache.h"
+ #include "model_types.h"
+ #include "tier1/utlmap.h"
++#include "c_baseanimating.h"
++#include "cliententitylist.h"
+ 
+ #include "tier0/memdbgon.h"
+ 
+@@ -41,6 +43,8 @@ static ConVar rt_sun_angle( "rt_sun_angle", "1.0", FCVAR_ARCHIVE, "Sun angular r
+ static ConVar rt_divisor( "rt_divisor", "2", FCVAR_ARCHIVE, "Trace resolution divisor (1 = full, 2 = half)." );
+ static ConVar rt_ao_rays( "rt_ao_rays", "2", FCVAR_ARCHIVE, "AO rays per pixel per frame." );
+ static ConVar rt_static_props( "rt_static_props", "1", FCVAR_ARCHIVE, "Include static props in the ray-traced geometry (takes effect on map load)." );
++static ConVar rt_dynamic( "rt_dynamic", "2", FCVAR_ARCHIVE, "Dynamic objects in the ray-traced geometry: 0 none, 1 rigid only (physics props, doors, brush entities), 2 also skinned (NPCs, ragdolls)." );
++static ConVar rt_dynamic_range( "rt_dynamic_range", "3000", FCVAR_ARCHIVE, "Dynamic objects further than this from the camera are left out." );
+ static ConVar rt_debug( "rt_debug", "0", 0, "0 off, 1 AO, 2 shadows, 3 normals, 4 depth." );
+ static ConVar rt_stats( "rt_stats", "0", 0, "Print ray tracing timing to the console periodically." );
+ 
+@@ -80,12 +84,9 @@ template <class T> static const T *Lump( const byte *pBase, const dheader_t *pHe
+ 	return (const T *)( pBase + l.fileofs );
+ }
+ 
+-static bool ExtractWorldGeometry( const char *pMapName, CUtlVector<float> &verts, CUtlVector<unsigned int> &indices )
++// Appends the triangles of BSP model nModel (0 = world, 1.. = brush entities, in model space).
++static bool ExtractBspModel( const byte *pBase, int nModel, CUtlVector<float> &verts, CUtlVector<unsigned int> &indices )
+ {
+-	CUtlBuffer buf;
+-	if ( !filesystem->ReadFile( pMapName, "GAME", buf ) )
+-		return false;
+-	const byte *pBase = (const byte *)buf.Base();
+ 	const dheader_t *pHeader = (const dheader_t *)pBase;
+ 	if ( pHeader->ident != IDBSPHEADER )
+ 		return false;
+@@ -103,11 +104,11 @@ static bool ExtractWorldGeometry( const char *pMapName, CUtlVector<float> &verts
+ 	int nStringTable, nStringData;
+ 	const int *pStringTable = Lump<int>( pBase, pHeader, LUMP_TEXDATA_STRING_TABLE, &nStringTable );
+ 	const char *pStringData = Lump<char>( pBase, pHeader, LUMP_TEXDATA_STRING_DATA, &nStringData );
+-	if ( nModels < 1 || nFaces < 1 )
++	if ( nModel < 0 || nModel >= nModels || nFaces < 1 )
+ 		return false;
+ 
+ 	const int nSkipFlags = SURF_SKY | SURF_SKY2D | SURF_NODRAW | SURF_TRIGGER | SURF_HINT | SURF_SKIP | SURF_TRANS;
+-	const dmodel_t &world = pModels[0];
++	const dmodel_t &world = pModels[nModel];
+ 	CUtlVector<Vector> faceVerts;
+ 	int nSkippedTrans = 0;
+ 
+@@ -201,6 +202,14 @@ static bool ExtractWorldGeometry( const char *pMapName, CUtlVector<float> &verts
+ 	return indices.Count() >= 3;
+ }
+ 
++static int BspModelCount( const byte *pBase )
++{
++	const dheader_t *pHeader = (const dheader_t *)pBase;
++	if ( pHeader->ident != IDBSPHEADER )
++		return 0;
++	return pHeader->lumps[LUMP_MODELS].filelen / (int)sizeof( dmodel_t );
++}
++
+ //-----------------------------------------------------------------------------
+ // Studio model triangles (rest pose, model space), cached per model.
+ // Translucent and alpha-tested materials are left out: without a texture lookup
+@@ -209,17 +218,38 @@ static bool ExtractWorldGeometry( const char *pMapName, CUtlVector<float> &verts
+ //-----------------------------------------------------------------------------
+ struct RTModelTris_t
+ {
++	RTModelTris_t() : bSkinned( false ), nMesh( 0 ), bMeshTried( false ) {}
+ 	CUtlVector<Vector> verts;
+ 	CUtlVector<unsigned int> indices;
++	CUtlVector<unsigned char> boneIdx;		// 4 per vertex (skinned only)
++	CUtlVector<float> boneWeight;			// 4 per vertex (skinned only)
++	bool bSkinned;
++	int nMesh;								// tracer mesh, created on first dynamic use
++	bool bMeshTried;
+ };
+ 
+ static CUtlMap<const model_t *, RTModelTris_t *> s_ModelTris( DefLessFunc( const model_t * ) );
++static CUtlVector<int> s_BrushMeshes;		// tracer mesh per BSP model index (0 = none)
+ 
+ static void ClearModelCache()
+ {
+ 	FOR_EACH_MAP_FAST( s_ModelTris, i )
++	{
++		if ( s_ModelTris[i]->nMesh && s_pRayTracer )
++			s_pRayTracer->DestroyMesh( s_ModelTris[i]->nMesh );
+ 		delete s_ModelTris[i];
++	}
+ 	s_ModelTris.RemoveAll();
++	s_BrushMeshes.RemoveAll();
++}
++
++static bool IsIdentity( const matrix3x4_t &m )
++{
++	for ( int r = 0; r < 3; r++ )
++		for ( int c = 0; c < 4; c++ )
++			if ( fabsf( m[r][c] - ( r == c ? 1.0f : 0.0f ) ) > 1e-4f )
++				return false;
++	return true;
+ }
+ 
+ static const RTModelTris_t *GetModelTriangles( const model_t *pModel, int nSkin, int nBody )
+@@ -236,6 +266,8 @@ static const RTModelTris_t *GetModelTriangles( const model_t *pModel, int nSkin,
+ 	studiohdr_t *pHdr = modelinfo->GetStudiomodel( pModel );
+ 	if ( !pHdr || pHdr->numbodyparts == 0 || pHdr->numbones > MAXSTUDIOBONES )
+ 		return pTris;
++	// rigid unless the model really is skinned: one bone whose pose-to-bone transform is the identity
++	pTris->bSkinned = !( pHdr->flags & STUDIOHDR_FLAGS_STATIC_PROP ) && !( pHdr->numbones == 1 && IsIdentity( pHdr->pBone( 0 )->poseToBone ) );
+ 	MDLHandle_t hModel = modelinfo->GetCacheHandle( pModel );
+ 	studiohwdata_t *pHW = mdlcache->GetHardwareData( hModel );
+ 	if ( !pHW )
+@@ -268,7 +300,23 @@ static const RTModelTris_t *GetModelTriangles( const model_t *pModel, int nSkin,
+ 			continue;
+ 		unsigned int base = pTris->verts.Count();
+ 		for ( int v = 0; v < batch.m_Verts.Count(); v++ )
+-			pTris->verts.AddToTail( batch.m_Verts[v].m_Position );
++		{
++			const GetTriangles_Vertex_t &gv = batch.m_Verts[v];
++			pTris->verts.AddToTail( gv.m_Position );
++			if ( pTris->bSkinned )
++			{
++				int n = clamp( gv.m_NumBones, 0, 4 );
++				float wsum = 0.0f;
++				for ( int j = 0; j < n; j++ ) wsum += gv.m_BoneWeight[j];
++				for ( int j = 0; j < 4; j++ )
++				{
++					bool bUse = j < n && gv.m_BoneIndex[j] >= 0 && gv.m_BoneIndex[j] < pHdr->numbones;
++					pTris->boneIdx.AddToTail( bUse ? (unsigned char)gv.m_BoneIndex[j] : 0 );
++					pTris->boneWeight.AddToTail( bUse ? ( wsum > 0.0f ? gv.m_BoneWeight[j] / wsum : ( j == 0 ? 1.0f : 0.0f ) ) : 0.0f );
++				}
++				if ( n == 0 ) pTris->boneWeight[pTris->boneWeight.Count() - 4] = 1.0f;
++			}
++		}
+ 		for ( int i = 0; i + 2 < batch.m_TriListIndices.Count(); i += 3 )
+ 		{
+ 			int a = batch.m_TriListIndices[i], bb = batch.m_TriListIndices[i+1], c = batch.m_TriListIndices[i+2];
+@@ -299,6 +347,126 @@ static int AppendModelInstance( const model_t *pModel, int nSkin, int nBody, con
+ 	return pTris->indices.Count() / 3;
+ }
+ 
++static int EnsureTracerMesh( RTModelTris_t *pTris )
++{
++	if ( !pTris || pTris->bMeshTried )
++		return pTris ? pTris->nMesh : 0;
++	pTris->bMeshTried = true;
++	IRayTracer *pRT = GetRayTracer();
++	if ( !pRT || pTris->indices.Count() < 3 )
++		return 0;
++	pTris->nMesh = pRT->CreateMesh( &pTris->verts[0].x, pTris->verts.Count(), pTris->indices.Base(), pTris->indices.Count() / 3,
++		pTris->bSkinned ? pTris->boneIdx.Base() : NULL, pTris->bSkinned ? pTris->boneWeight.Base() : NULL );
++	return pTris->nMesh;
++}
++
++static void MatrixToRows( const matrix3x4_t &m, float *pOut )
++{
++	memcpy( pOut, m.Base(), 12 * sizeof( float ) );
++}
++
++static CUtlVector<RTInstance> s_Instances;
++static CUtlVector<float> s_BonePool;
++static int s_nDumpDynamic = 0;
++CON_COMMAND( rt_list_dynamic, "Print the dynamic objects considered for ray tracing on the next frame" ) { s_nDumpDynamic = 1; }
++#define RTDYN_SKIP( why ) { if ( s_nDumpDynamic ) Msg( "[rt]   skip %d %s (%s): %s\n", pEnt->entindex(), pEnt->GetClassname(), pModel ? modelinfo->GetModelName( pModel ) : "-", why ); continue; }
++
++// Collects this frame's dynamic objects and hands them to the tracer.
++static void UpdateDynamicInstances( const CViewSetup &view )
++{
++	IRayTracer *pRT = GetRayTracer();
++	if ( !pRT )
++		return;
++	s_Instances.RemoveAll();
++	s_BonePool.RemoveAll();
++	if ( rt_dynamic.GetBool() )
++	{
++		C_BaseAnimating::AutoAllowBoneAccess boneaccess( true, false );
++		C_BasePlayer *pLocal = C_BasePlayer::GetLocalPlayer();
++		float flRangeSqr = rt_dynamic_range.GetFloat() * rt_dynamic_range.GetFloat();
++		int nSeen = 0;
++		for ( C_BaseEntity *pEnt = ClientEntityList().FirstBaseEntity(); pEnt; pEnt = ClientEntityList().NextBaseEntity( pEnt ) )
++		{
++			nSeen++;
++			const model_t *pModel = pEnt->GetModel();
++			if ( pEnt == pLocal || pEnt->entindex() == 0 )
++				continue;
++			if ( !pModel )
++				continue;
++			if ( pEnt->IsDormant() ) RTDYN_SKIP( "dormant" );
++			if ( pEnt->IsEffectActive( EF_NODRAW ) ) RTDYN_SKIP( "nodraw" );
++			if ( pEnt->GetRenderMode() == kRenderNone ) RTDYN_SKIP( "rendermode none" );
++			if ( ( pEnt->GetAbsOrigin() - view.origin ).LengthSqr() > flRangeSqr ) RTDYN_SKIP( "out of range" );
++			int nType = modelinfo->GetModelType( pModel );
++			RTInstance inst;
++			inst.m_nKey = (unsigned int)pEnt->GetRefEHandle().ToInt();
++			inst.m_nBoneOffset = -1;
++			inst.m_nBones = 0;
++			if ( nType == mod_brush )
++			{
++				const char *pName = modelinfo->GetModelName( pModel );
++				if ( !pName || pName[0] != '*' ) RTDYN_SKIP( "brush model name" );
++				int nIdx = atoi( pName + 1 );
++				if ( nIdx <= 0 || nIdx >= s_BrushMeshes.Count() || !s_BrushMeshes[nIdx] ) RTDYN_SKIP( "no brush mesh" );
++				if ( s_nDumpDynamic ) Msg( "[rt]   brush %d %s %s\n", pEnt->entindex(), pEnt->GetClassname(), pName );
++				inst.m_nMesh = s_BrushMeshes[nIdx];
++				MatrixToRows( pEnt->RenderableToWorldTransform(), inst.m_modelToWorld );
++				s_Instances.AddToTail( inst );
++				continue;
++			}
++			if ( nType != mod_studio ) RTDYN_SKIP( "not studio/brush" );
++			C_BaseAnimating *pAnim = pEnt->GetBaseAnimating();
++			if ( !pAnim ) RTDYN_SKIP( "not animating" );
++			if ( pAnim->IsViewModel() ) RTDYN_SKIP( "viewmodel" );
++			if ( !pAnim->ShouldDraw() ) RTDYN_SKIP( "ShouldDraw false" );
++			RTModelTris_t *pTris = const_cast<RTModelTris_t *>( GetModelTriangles( pModel, pAnim->GetSkin(), pAnim->GetBody() ) );
++			int nMesh = EnsureTracerMesh( pTris );
++			if ( !nMesh ) RTDYN_SKIP( "no mesh" );
++			if ( s_nDumpDynamic ) Msg( "[rt]   %s %d %s %s (%d tris)\n", pTris->bSkinned ? "skinned" : "rigid", pEnt->entindex(), pEnt->GetClassname(), modelinfo->GetModelName( pModel ), pTris->indices.Count() / 3 );
++			inst.m_nMesh = nMesh;
++			if ( pTris->bSkinned )
++			{
++				if ( rt_dynamic.GetInt() < 2 )
++					continue;
++				studiohdr_t *pHdr = modelinfo->GetStudiomodel( pModel );
++				if ( !pHdr )
++					continue;
++				static matrix3x4_t s_Bones[MAXSTUDIOBONES];
++				if ( !pAnim->SetupBones( s_Bones, MAXSTUDIOBONES, BONE_USED_BY_ANYTHING, gpGlobals->curtime ) )
++					continue;
++				inst.m_nBoneOffset = s_BonePool.Count();
++				inst.m_nBones = pHdr->numbones;
++				bool bFinite = true;
++				for ( int i = 0; i < pHdr->numbones; i++ )
++				{
++					matrix3x4_t poseToWorld;
++					ConcatTransforms( s_Bones[i], pHdr->pBone( i )->poseToBone, poseToWorld );
++					int at = s_BonePool.AddMultipleToTail( 12 );
++					MatrixToRows( poseToWorld, &s_BonePool[at] );
++					for ( int k = 0; k < 12; k++ ) if ( !IsFinite( s_BonePool[at + k] ) ) bFinite = false;
++				}
++				if ( !bFinite )
++				{
++					s_BonePool.SetCountNonDestructively( inst.m_nBoneOffset );
++					RTDYN_SKIP( "non-finite bones" );
++				}
++				SetIdentityMatrix( *(matrix3x4_t *)inst.m_modelToWorld );
++			}
++			else
++			{
++				MatrixToRows( pAnim->RenderableToWorldTransform(), inst.m_modelToWorld );
++			}
++			s_Instances.AddToTail( inst );
++		}
++	}
++	if ( s_nDumpDynamic )
++	{
++		Msg( "[rt] %d instances this frame (%d bone floats)\n", s_Instances.Count(), s_BonePool.Count() );
++		s_nDumpDynamic = 0;
++	}
++	pRT->SetInstances( s_Instances.Base(), s_Instances.Count(), s_BonePool.Base(), s_BonePool.Count() );
++}
++
+ static int AppendStaticProps( CUtlVector<float> &verts, CUtlVector<unsigned int> &indices, int *pnProps )
+ {
+ 	*pnProps = 0;
+@@ -382,8 +550,10 @@ public:
+ 		if ( !pRT )
+ 			return;
+ 		double t0 = Plat_FloatTime();
++		ClearModelCache();
++		CUtlBuffer buf;
+ 		CUtlVector<float> verts; CUtlVector<unsigned int> indices;
+-		if ( !ExtractWorldGeometry( engine->GetLevelName(), verts, indices ) )
++		if ( !filesystem->ReadFile( engine->GetLevelName(), "GAME", buf ) || !ExtractBspModel( (const byte *)buf.Base(), 0, verts, indices ) )
+ 		{
+ 			Warning( "[rt] could not extract world geometry from %s\n", engine->GetLevelName() );
+ 			return;
+@@ -392,17 +562,31 @@ public:
+ 		int nPropTris = 0, nProps = 0;
+ 		if ( rt_static_props.GetBool() )
+ 			nPropTris = AppendStaticProps( verts, indices, &nProps );
+-		ClearModelCache();
+ 		pRT->SetWorldGeometry( verts.Base(), verts.Count() / 3, indices.Base(), indices.Count() / 3 );
++		// brush entities (doors, trains, breakables): one mesh per BSP model, instanced per frame
++		int nBrushModels = BspModelCount( (const byte *)buf.Base() ), nBrushTris = 0;
++		s_BrushMeshes.SetCount( nBrushModels );
++		for ( int i = 0; i < nBrushModels; i++ )
++		{
++			s_BrushMeshes[i] = 0;
++			if ( i == 0 ) continue;
++			CUtlVector<float> mv; CUtlVector<unsigned int> mi;
++			if ( ExtractBspModel( (const byte *)buf.Base(), i, mv, mi ) )
++			{
++				s_BrushMeshes[i] = pRT->CreateMesh( mv.Base(), mv.Count() / 3, mi.Base(), mi.Count() / 3, NULL, NULL );
++				nBrushTris += mi.Count() / 3;
++			}
++		}
+ 		s_vSunDir = FindSunDirection();
+ 		s_bWorldLoaded = true;
+ 		s_nFrame = 0;
+-		Msg( "[rt] %s: %d world triangles + %d from %d static props (%.0f ms), sun dir %.2f %.2f %.2f\n", engine->GetLevelName(), nWorldTris, nPropTris, nProps, ( Plat_FloatTime() - t0 ) * 1000.0, s_vSunDir.x, s_vSunDir.y, s_vSunDir.z );
++		Msg( "[rt] %s: %d world triangles + %d from %d static props, %d brush models (%d triangles) (%.0f ms), sun dir %.2f %.2f %.2f\n", engine->GetLevelName(), nWorldTris, nPropTris, nProps, nBrushModels - 1, nBrushTris, ( Plat_FloatTime() - t0 ) * 1000.0, s_vSunDir.x, s_vSunDir.y, s_vSunDir.z );
+ 	}
+ 
+ 	virtual void LevelShutdownPreEntity() OVERRIDE
+ 	{
+ 		s_bWorldLoaded = false;
++		ClearModelCache();
+ 		if ( s_pRayTracer )
+ 			s_pRayTracer->ClearWorld();
+ 	}
+@@ -464,6 +648,8 @@ void RT_DrawComposite( const CViewSetup &view )
+ 	if ( !pMat )
+ 		return;
+ 
++	UpdateDynamicInstances( view );
++
+ 	VMatrix worldToView, viewToProj, worldToProj, worldToPixels;
+ 	render->GetMatricesForView( view, &worldToView, &viewToProj, &worldToProj, &worldToPixels );
+ 	VMatrix projToWorld;
+@@ -507,7 +693,6 @@ CON_COMMAND( rt_list_props, "List static props (model, origin, triangles in the
+ 		const Vector &o = pProp->GetCollisionOrigin();
+ 		Msg( "[rt] prop %3d %-48s %8.0f %8.0f %8.0f  %d tris\n", i, modelinfo->GetModelName( pModel ), o.x, o.y, o.z, pTris ? pTris->indices.Count() / 3 : 0 );
+ 	}
+-	ClearModelCache();
+ }
+ 
+ CON_COMMAND( rt_status, "Ray tracing layer status" )
+diff --git a/public/rtmetal/iraytracer.h b/public/rtmetal/iraytracer.h
+index e69bf49..8c1a4ec 100644
+--- a/public/rtmetal/iraytracer.h
++++ b/public/rtmetal/iraytracer.h
+@@ -8,7 +8,7 @@
+ 
+ #include "interface.h"
+ 
+-#define RAYTRACER_INTERFACE_VERSION "RayTracer001"
++#define RAYTRACER_INTERFACE_VERSION "RayTracer002"
+ 
+ struct RTFrameParams
+ {
+@@ -28,14 +28,30 @@ struct RTFrameParams
+ 	int		m_nAORays;					// AO rays per pixel per frame
+ };
+ 
++// One dynamic object for a frame: an instance of a mesh created with CreateMesh.
++struct RTInstance
++{
++	int				m_nMesh;
++	unsigned int	m_nKey;				// stable per object across frames (skinned meshes keep a refitted BVH per key)
++	float			m_modelToWorld[12];	// row-major 3x4, as matrix3x4_t
++	int				m_nBoneOffset;		// index into the bone matrix pool (row-major 3x4 pose-to-world per bone), -1 for rigid
++	int				m_nBones;
++};
++
+ abstract_class IRayTracer
+ {
+ public:
+ 	virtual bool Init() = 0;								// any thread, once; false if Metal ray tracing unavailable
+ 	virtual bool IsAvailable() = 0;
+-	// Replaces the world geometry (copied). Triangles in world space; indices are triples.
++	// Replaces the static geometry (copied). Triangles in world space; indices are triples.
+ 	virtual void SetWorldGeometry( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris ) = 0;
+-	virtual void ClearWorld() = 0;
++	virtual void ClearWorld() = 0;								// also destroys all meshes and instances
++	// Dynamic meshes, in model space (copied). Optional skinning data: 4 bone indices and 4 weights per vertex.
++	// Returns 0 on failure. Any thread.
++	virtual int CreateMesh( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned char *pBoneIndices4, const float *pBoneWeights4 ) = 0;
++	virtual void DestroyMesh( int nMesh ) = 0;
++	// Replaces this frame's dynamic instances (copied). pBonePool holds nPoolFloats floats. Any thread.
++	virtual void SetInstances( const RTInstance *pInstances, int nInstances, const float *pBonePool, int nPoolFloats ) = 0;
+ 	// Render thread only, GL context current.
+ 	// CaptureDepth: call right after the 3D scene is drawn (its depth is in the current drawing framebuffer).
+ 	virtual bool CaptureDepth( int nResolutionDivisor ) = 0;
+diff --git a/rtmetal/rtmetal.mm b/rtmetal/rtmetal.mm
+index 3500ccb..2736fa2 100644
+--- a/rtmetal/rtmetal.mm
++++ b/rtmetal/rtmetal.mm
+@@ -9,9 +9,11 @@
+ #import <IOSurface/IOSurface.h>
+ #import <Foundation/Foundation.h>
+ #include <dlfcn.h>
++#include <unistd.h>
+ #define DONT_DEFINE_BOOL	// Cocoa already has one
+ #include <mutex>
+ #include <vector>
++#include <map>
+ #include "rtmetal/iraytracer.h"
+ #include "tier0/dbg.h"
+ #include "tier1/interface.h"
+@@ -69,9 +71,30 @@ static float3 cosineHemisphere(float3 n, float u1, float u2) {
+     return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
+ }
+ 
++// skins a mesh's rest-pose vertices into world space with row-major 3x4 pose-to-world matrices
++kernel void skin(constant uint& nVerts [[buffer(0)]],
++                 device const float4* rest [[buffer(1)]],
++                 device const uchar4* boneIdx [[buffer(2)]],
++                 device const float4* boneWeight [[buffer(3)]],
++                 device const float* bones [[buffer(4)]],
++                 device float4* outVerts [[buffer(5)]],
++                 uint id [[thread_position_in_grid]])
++{
++    if (id >= nVerts) return;
++    float4 p = float4(rest[id].xyz, 1.0);
++    uchar4 b = boneIdx[id]; float4 w = boneWeight[id];
++    float3 r = float3(0.0);
++    for (int i = 0; i < 4; i++) {
++        if (w[i] <= 0.0) continue;
++        device const float* m = bones + uint(b[i]) * 12u;
++        r += w[i] * float3(dot(float4(m[0], m[1], m[2], m[3]), p), dot(float4(m[4], m[5], m[6], m[7]), p), dot(float4(m[8], m[9], m[10], m[11]), p));
++    }
++    outVerts[id] = float4(r, 0.0);
++}
++
+ // half-res: raw visibility (R = ao, G = sun), linear depth in B, normal encoded? keep B=view distance, A = valid
+ kernel void trace(constant Params& p [[buffer(0)]],
+-                  primitive_acceleration_structure accel [[buffer(1)]],
++                  instance_acceleration_structure accel [[buffer(1)]],
+                   texture2d<float, access::read> depthTex [[texture(0)]],
+                   texture2d<float, access::write> rawTex [[texture(1)]],
+                   texture2d<float, access::write> normalTex [[texture(2)]],
+@@ -97,7 +120,7 @@ kernel void trace(constant Params& p [[buffer(0)]],
+     float bias = 0.5 + dist * 0.002;
+     float3 origin = P + N * bias;
+ 
+-    intersector<triangle_data> isect;
++    intersector<triangle_data, instancing> isect;
+     isect.set_triangle_cull_mode(triangle_cull_mode::none);
+     isect.assume_geometry_type(geometry_type::triangle);
+     uint seed = hash(gid.x * 1973u + gid.y * 9277u + uint(p.frame) * 26699u);
+@@ -109,7 +132,7 @@ kernel void trace(constant Params& p [[buffer(0)]],
+         for (int i = 0; i < n; i++) {
+             float3 dir = cosineHemisphere(N, rnd(seed), rnd(seed));
+             ray r; r.origin = origin; r.direction = dir; r.min_distance = 0.0; r.max_distance = p.aoRadius;
+-            intersection_result<triangle_data> res = isect.intersect(r, accel);
++            intersection_result<triangle_data, instancing> res = isect.intersect(r, accel);
+             float v = 1.0;
+             if (res.type != intersection_type::none) {
+                 // distance-weighted occlusion
+@@ -132,7 +155,7 @@ kernel void trace(constant Params& p [[buffer(0)]],
+             float cosA = mix(p.sunCosAngle, 1.0, u1), sinA = sqrt(1.0 - cosA * cosA), phi = 6.28318530718 * u2;
+             float3 dir = normalize(sunDir * cosA + t * (sinA * cos(phi)) + b * (sinA * sin(phi)));
+             ray r; r.origin = origin; r.direction = dir; r.min_distance = 0.0; r.max_distance = 16384.0;
+-            intersection_result<triangle_data> res = isect.intersect(r, accel);
++            intersection_result<triangle_data, instancing> res = isect.intersect(r, accel);
+             if (res.type != intersection_type::none) sun = 0.0;
+         }
+     }
+@@ -168,9 +191,23 @@ kernel void temporal(constant Params& p [[buffer(0)]],
+                 float prevDist = h.b;
+                 float tol = 0.02 * max(raw.b, 1.0) + 2.0;
+                 if (abs(prevDist - raw.b) < tol * 4.0 && h.a > 0.0) {
++                    // variance clipping against the 3x3 neighbourhood of this frame's samples, so
++                    // occlusion from moving objects does not trail behind them
++                    float2 m1 = 0.0, m2 = 0.0; float n = 0.0;
++                    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
++                        int2 q = clamp(int2(gid) + int2(dx, dy), int2(0), int2(p.halfW - 1, p.halfH - 1));
++                        float4 s2 = rawTex.read(uint2(q));
++                        if (s2.a == 0.0) continue;
++                        m1 += s2.rg; m2 += s2.rg * s2.rg; n += 1.0;
++                    }
++                    float2 mean = m1 / max(n, 1.0);
++                    float2 sigma = sqrt(max(m2 / max(n, 1.0) - mean * mean, 0.0));
++                    float2 lo = mean - 1.5 * sigma - 0.05, hi = mean + 1.5 * sigma + 0.05;
++                    float2 hc = clamp(h.rg, lo, hi);
+                     count = min(h.a, 31.0);
++                    if (any(abs(hc - h.rg) > 0.02)) count = min(count, 6.0);
+                     float w = 1.0 / (count + 1.0);
+-                    acc = mix(h.rg, raw.rg, w);
++                    acc = mix(hc, raw.rg, w);
+                 }
+             }
+         }
+@@ -255,26 +292,70 @@ struct RTParamsGPU
+ 	int aoRays; int pad0; int pad1; int pad2;
+ };
+ 
++// A dynamic mesh: rest-pose geometry in model space. Rigid meshes carry a prebuilt BVH;
++// skinned meshes are skinned per instance into world space and refitted each frame.
++struct RTMesh_t
++{
++	id<MTLBuffer> vb, ib, boneIdx, boneWeight;
++	int nVerts, nTris;
++	bool bSkinned;
++	id<MTLAccelerationStructure> rigidAS;
++	MTLAccelerationStructureSizes sizes;
++};
++
++// Per-object state for a skinned instance, keyed by the client's instance key.
++struct RTSkinnedInstance_t
++{
++	int nMesh;
++	id<MTLBuffer> worldVB, boneBuf, scratch;
++	id<MTLAccelerationStructure> as;
++	bool bBuilt;
++	int nLastFrame;
++};
++
+ class CRayTracerMetal : public IRayTracer
+ {
+ public:
+ 	CRayTracerMetal() : m_bInit( false ), m_bAvailable( false ), m_pDevice( nil ), m_pQueue( nil ), m_pAccel( nil ), m_pPendingAccel( nil ),
+ 		m_depthSurface( NULL ), m_resultSurface( NULL ), m_nFullW( 0 ), m_nFullH( 0 ), m_nHalfW( 0 ), m_nHalfH( 0 ), m_nHistoryIndex( 0 ), m_bHistoryValid( false ),
+-		m_pfnGetBackbufferInfo( NULL ), m_pfnResolveDepth( NULL ), m_pfnComposite( NULL ), m_bDepthCaptured( false ), m_flTimeResolve( 0 ), m_flTimeMetalWall( 0 ), m_flTimeMetalGPU( 0 ), m_flTimeComposite( 0 ), m_nTimedFrames( 0 ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; }
++		m_pfnGetBackbufferInfo( NULL ), m_pfnResolveDepth( NULL ), m_pfnComposite( NULL ), m_bDepthCaptured( false ), m_flTimeResolve( 0 ), m_flTimeMetalWall( 0 ), m_flTimeMetalGPU( 0 ), m_flTimeComposite( 0 ), m_nTimedFrames( 0 ),
++		m_nNextMesh( 1 ), m_bPendingInstances( false ), m_pInstanceDescBuffer( nil ), m_pInstanceScratch( nil ), m_pInstanceAS( nil ), m_nInstanceCapacity( 0 ), m_nFrameCounter( 0 ), m_nLastInstanceCount( 0 ), m_nLastSkinnedCount( 0 ), m_flTimeDynamic( 0 ), m_pSkin( nil ) { m_szStatus[0] = 0; m_szTiming[0] = 0; m_szStatusFull[0] = 0; }
+ 
+ 	virtual bool Init() OVERRIDE;
+ 	virtual bool IsAvailable() OVERRIDE { return m_bAvailable; }
+ 	virtual void SetWorldGeometry( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris ) OVERRIDE;
+ 	virtual void ClearWorld() OVERRIDE;
++	virtual int CreateMesh( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned char *pBoneIndices4, const float *pBoneWeights4 ) OVERRIDE;
++	virtual void DestroyMesh( int nMesh ) OVERRIDE;
++	virtual void SetInstances( const RTInstance *pInstances, int nInstances, const float *pBonePool, int nPoolFloats ) OVERRIDE;
+ 	virtual bool CaptureDepth( int nResolutionDivisor ) OVERRIDE;
+ 	virtual bool ApplyAndComposite( const RTFrameParams &params ) OVERRIDE;
+ 	virtual const char *GetStatus() OVERRIDE { snprintf( m_szStatusFull, sizeof( m_szStatusFull ), "%s; %s", m_szStatus, m_szTiming ); return m_szStatusFull; }
+ 	bool m_bDepthCaptured;
+-	double m_flTimeResolve, m_flTimeMetalWall, m_flTimeMetalGPU, m_flTimeComposite; int m_nTimedFrames; char m_szTiming[256]; char m_szStatusFull[512];
++	double m_flTimeResolve, m_flTimeMetalWall, m_flTimeMetalGPU, m_flTimeComposite; int m_nTimedFrames; char m_szTiming[512]; char m_szStatusFull[800];
+ 
+ private:
+ 	bool EnsureTargets( int w, int h, int divisor );
+ 	void SetStatus( const char *fmt, ... );
++	id<MTLAccelerationStructure> BuildPrimitiveAS( MTLPrimitiveAccelerationStructureDescriptor *desc, MTLAccelerationStructureSizes *pSizes );
++	MTLPrimitiveAccelerationStructureDescriptor *MeshDescriptor( const RTMesh_t &mesh, id<MTLBuffer> vb );
++	void DestroySkinnedInstance( RTSkinnedInstance_t &inst );
++	bool EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArray *pKeepAlive, id<MTLAccelerationStructure> *ppInstanceAS, NSArray **ppPrimitiveASes, int *pnInstances );
++
++	// dynamic scene (mutex-protected: client thread writes, render thread reads)
++	std::mutex m_meshMutex;
++	std::map<int, RTMesh_t> m_meshes;
++	int m_nNextMesh;
++	std::vector<RTInstance> m_pendingInstances, m_frameInstances;
++	std::vector<float> m_pendingBones, m_frameBones;
++	bool m_bPendingInstances;
++	std::map<unsigned int, RTSkinnedInstance_t> m_skinned;
++	id<MTLBuffer> m_pInstanceDescBuffer, m_pInstanceScratch;
++	id<MTLAccelerationStructure> m_pInstanceAS;
++	int m_nInstanceCapacity;
++	int m_nFrameCounter, m_nLastInstanceCount, m_nLastSkinnedCount;
++	double m_flTimeDynamic;
++	id<MTLComputePipelineState> m_pSkin;
+ 
+ 	bool m_bInit, m_bAvailable;
+ 	id<MTLDevice> m_pDevice;
+@@ -315,7 +396,7 @@ bool CRayTracerMetal::Init()
+ 		id<MTLLibrary> lib = [m_pDevice newLibraryWithSource:[NSString stringWithUTF8String:s_pKernels] options:nil error:&err];
+ 		if ( !lib ) { SetStatus( "kernel compile failed: %s", [[err localizedDescription] UTF8String] ); return false; }
+ 		struct { const char *name; id<MTLComputePipelineState> *out; } kernels[] = {
+-			{ "trace", &m_pTrace }, { "temporal", &m_pTemporal }, { "blur", &m_pBlur }, { "composite", &m_pComposite } };
++			{ "trace", &m_pTrace }, { "temporal", &m_pTemporal }, { "blur", &m_pBlur }, { "composite", &m_pComposite }, { "skin", &m_pSkin } };
+ 		for ( auto &k : kernels )
+ 		{
+ 			id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:k.name]];
+@@ -352,16 +433,8 @@ void CRayTracerMetal::SetWorldGeometry( const float *pVertsXYZ, int nVerts, cons
+ 		geom.opaque = YES;
+ 		MTLPrimitiveAccelerationStructureDescriptor *desc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+ 		desc.geometryDescriptors = @[ geom ];
+-		MTLAccelerationStructureSizes sizes = [m_pDevice accelerationStructureSizesWithDescriptor:desc];
+-		id<MTLAccelerationStructure> accel = [m_pDevice newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+-		id<MTLBuffer> scratch = [m_pDevice newBufferWithLength:sizes.buildScratchBufferSize options:MTLResourceStorageModePrivate];
+-		id<MTLCommandBuffer> cb = [m_pQueue commandBuffer];
+-		id<MTLAccelerationStructureCommandEncoder> enc = [cb accelerationStructureCommandEncoder];
+-		[enc buildAccelerationStructure:accel descriptor:desc scratchBuffer:scratch scratchBufferOffset:0];
+-		[enc endEncoding];
+-		[cb commit];
+-		[cb waitUntilCompleted];
+-		[scratch release];
++		MTLAccelerationStructureSizes sizes;
++		id<MTLAccelerationStructure> accel = BuildPrimitiveAS( desc, &sizes );
+ 		{
+ 			std::lock_guard<std::mutex> lock( m_accelMutex );
+ 			if ( m_pPendingAccel ) [m_pPendingAccel release];
+@@ -377,10 +450,283 @@ void CRayTracerMetal::SetWorldGeometry( const float *pVertsXYZ, int nVerts, cons
+ 
+ void CRayTracerMetal::ClearWorld()
+ {
+-	std::lock_guard<std::mutex> lock( m_accelMutex );
+-	if ( m_pAccel ) { [m_pAccel release]; m_pAccel = nil; }
+-	if ( m_pPendingAccel ) { [m_pPendingAccel release]; m_pPendingAccel = nil; }
+-	m_bHistoryValid = false;
++	{
++		std::lock_guard<std::mutex> lock( m_accelMutex );
++		if ( m_pAccel ) { [m_pAccel release]; m_pAccel = nil; }
++		if ( m_pPendingAccel ) { [m_pPendingAccel release]; m_pPendingAccel = nil; }
++		m_bHistoryValid = false;
++	}
++	std::lock_guard<std::mutex> lock( m_meshMutex );
++	for ( auto &kv : m_meshes )
++	{
++		RTMesh_t &m = kv.second;
++		[m.vb release]; [m.ib release]; [m.boneIdx release]; [m.boneWeight release]; [m.rigidAS release];
++	}
++	m_meshes.clear();
++	for ( auto &kv : m_skinned )
++		DestroySkinnedInstance( kv.second );
++	m_skinned.clear();
++	m_pendingInstances.clear(); m_pendingBones.clear(); m_frameInstances.clear(); m_frameBones.clear();
++	m_bPendingInstances = true;	// an empty frame replaces whatever was queued
++}
++
++//-----------------------------------------------------------------------------
++// Dynamic meshes and instances
++//-----------------------------------------------------------------------------
++id<MTLAccelerationStructure> CRayTracerMetal::BuildPrimitiveAS( MTLPrimitiveAccelerationStructureDescriptor *desc, MTLAccelerationStructureSizes *pSizes )
++{
++	MTLAccelerationStructureSizes sizes = [m_pDevice accelerationStructureSizesWithDescriptor:desc];
++	if ( pSizes ) *pSizes = sizes;
++	id<MTLAccelerationStructure> accel = [m_pDevice newAccelerationStructureWithSize:sizes.accelerationStructureSize];
++	id<MTLBuffer> scratch = [m_pDevice newBufferWithLength:sizes.buildScratchBufferSize options:MTLResourceStorageModePrivate];
++	id<MTLCommandBuffer> cb = [m_pQueue commandBuffer];
++	id<MTLAccelerationStructureCommandEncoder> enc = [cb accelerationStructureCommandEncoder];
++	[enc buildAccelerationStructure:accel descriptor:desc scratchBuffer:scratch scratchBufferOffset:0];
++	[enc endEncoding];
++	[cb commit];
++	[cb waitUntilCompleted];
++	[scratch release];
++	return accel;
++}
++
++MTLPrimitiveAccelerationStructureDescriptor *CRayTracerMetal::MeshDescriptor( const RTMesh_t &mesh, id<MTLBuffer> vb )
++{
++	MTLAccelerationStructureTriangleGeometryDescriptor *geom = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
++	geom.vertexBuffer = vb; geom.vertexStride = 16; geom.vertexFormat = MTLAttributeFormatFloat3;
++	geom.indexBuffer = mesh.ib; geom.indexType = MTLIndexTypeUInt32; geom.triangleCount = mesh.nTris;
++	geom.opaque = YES;
++	MTLPrimitiveAccelerationStructureDescriptor *desc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
++	desc.geometryDescriptors = @[ geom ];
++	if ( mesh.bSkinned )
++		desc.usage = MTLAccelerationStructureUsageRefit;	// skinned copies are refitted every frame
++	return desc;
++}
++
++int CRayTracerMetal::CreateMesh( const float *pVertsXYZ, int nVerts, const unsigned int *pIndices, int nTris, const unsigned char *pBoneIndices4, const float *pBoneWeights4 )
++{
++	if ( !m_bAvailable || nTris <= 0 || nVerts <= 0 )
++		return 0;
++	@autoreleasepool
++	{
++		RTMesh_t mesh;
++		memset( &mesh, 0, sizeof( mesh ) );
++		std::vector<float> padded( (size_t)nVerts * 4 );
++		for ( int i = 0; i < nVerts; i++ ) { padded[i*4] = pVertsXYZ[i*3]; padded[i*4+1] = pVertsXYZ[i*3+1]; padded[i*4+2] = pVertsXYZ[i*3+2]; padded[i*4+3] = 0; }
++		mesh.vb = [m_pDevice newBufferWithBytes:padded.data() length:padded.size() * sizeof( float ) options:MTLResourceStorageModeShared];
++		mesh.ib = [m_pDevice newBufferWithBytes:pIndices length:(size_t)nTris * 3 * sizeof( unsigned int ) options:MTLResourceStorageModeShared];
++		mesh.nVerts = nVerts; mesh.nTris = nTris;
++		mesh.bSkinned = pBoneIndices4 && pBoneWeights4;
++		if ( mesh.bSkinned )
++		{
++			mesh.boneIdx = [m_pDevice newBufferWithBytes:pBoneIndices4 length:(size_t)nVerts * 4 options:MTLResourceStorageModeShared];
++			mesh.boneWeight = [m_pDevice newBufferWithBytes:pBoneWeights4 length:(size_t)nVerts * 4 * sizeof( float ) options:MTLResourceStorageModeShared];
++			// sizes for the per-instance world-space copies (same topology)
++			mesh.sizes = [m_pDevice accelerationStructureSizesWithDescriptor:MeshDescriptor( mesh, mesh.vb )];
++		}
++		else
++		{
++			mesh.rigidAS = BuildPrimitiveAS( MeshDescriptor( mesh, mesh.vb ), &mesh.sizes );
++		}
++		std::lock_guard<std::mutex> lock( m_meshMutex );
++		int id = m_nNextMesh++;
++		m_meshes[id] = mesh;
++		return id;
++	}
++}
++
++void CRayTracerMetal::DestroySkinnedInstance( RTSkinnedInstance_t &inst )
++{
++	[inst.worldVB release]; [inst.boneBuf release]; [inst.scratch release]; [inst.as release];
++	inst.worldVB = nil; inst.boneBuf = nil; inst.scratch = nil; inst.as = nil;
++}
++
++void CRayTracerMetal::DestroyMesh( int nMesh )
++{
++	std::lock_guard<std::mutex> lock( m_meshMutex );
++	auto it = m_meshes.find( nMesh );
++	if ( it == m_meshes.end() )
++		return;
++	RTMesh_t &m = it->second;
++	[m.vb release]; [m.ib release]; [m.boneIdx release]; [m.boneWeight release]; [m.rigidAS release];
++	m_meshes.erase( it );
++	for ( auto sk = m_skinned.begin(); sk != m_skinned.end(); )
++	{
++		if ( sk->second.nMesh == nMesh ) { DestroySkinnedInstance( sk->second ); sk = m_skinned.erase( sk ); }
++		else ++sk;
++	}
++}
++
++void CRayTracerMetal::SetInstances( const RTInstance *pInstances, int nInstances, const float *pBonePool, int nPoolFloats )
++{
++	std::lock_guard<std::mutex> lock( m_meshMutex );
++	m_pendingInstances.assign( pInstances, pInstances + ( nInstances > 0 ? nInstances : 0 ) );
++	m_pendingBones.assign( pBonePool, pBonePool + ( nPoolFloats > 0 ? nPoolFloats : 0 ) );
++	m_bPendingInstances = true;
++}
++
++static inline void PackTransform( const float *m /* row-major 3x4 */, MTLPackedFloat4x3 *pOut )
++{
++	for ( int c = 0; c < 4; c++ )
++	{
++		pOut->columns[c].x = m[0*4 + c];
++		pOut->columns[c].y = m[1*4 + c];
++		pOut->columns[c].z = m[2*4 + c];
++	}
++}
++
++// Encodes skinning, BVH builds/refits and the instance structure for this frame's dynamic
++// objects plus the static world. Called on the render thread with m_pAccel valid.
++bool CRayTracerMetal::EncodeDynamicScene( id<MTLCommandBuffer> cb, NSMutableArray *pKeepAlive, id<MTLAccelerationStructure> *ppInstanceAS, NSArray **ppPrimitiveASes, int *pnInstances )
++{
++	std::lock_guard<std::mutex> lock( m_meshMutex );
++	if ( m_bPendingInstances )
++	{
++		m_frameInstances.swap( m_pendingInstances );
++		m_frameBones.swap( m_pendingBones );
++		m_bPendingInstances = false;
++	}
++	m_nFrameCounter++;
++
++	NSMutableArray *prims = [NSMutableArray arrayWithObject:m_pAccel];
++	std::map<void *, int> primIndex;	// AS -> index in prims
++	primIndex[(void *)m_pAccel] = 0;
++	std::vector<MTLAccelerationStructureInstanceDescriptor> descs;
++	descs.reserve( m_frameInstances.size() + 1 );
++	MTLAccelerationStructureInstanceDescriptor d;
++	memset( &d, 0, sizeof( d ) );
++	static const float s_identity[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
++	PackTransform( s_identity, &d.transformationMatrix );
++	d.options = MTLAccelerationStructureInstanceOptionOpaque;
++	d.mask = 0xFF;
++	d.accelerationStructureIndex = 0;
++	descs.push_back( d );
++
++	id<MTLComputeCommandEncoder> ce = nil;
++	id<MTLAccelerationStructureCommandEncoder> ae = nil;
++	int nSkinned = 0;
++	// 1) skinning for every skinned instance (compute), 2) builds/refits (AS encoder)
++	std::vector<std::pair<RTSkinnedInstance_t *, const RTMesh_t *>> skinnedThisFrame;
++	for ( const RTInstance &inst : m_frameInstances )
++	{
++		auto mit = m_meshes.find( inst.m_nMesh );
++		if ( mit == m_meshes.end() )
++			continue;
++		const RTMesh_t &mesh = mit->second;
++		if ( !mesh.bSkinned || inst.m_nBoneOffset < 0 || inst.m_nBones <= 0 )
++		{
++			if ( !mesh.rigidAS )
++				continue;
++			auto pi = primIndex.find( (void *)mesh.rigidAS );
++			int idx;
++			if ( pi == primIndex.end() ) { idx = (int)[prims count]; [prims addObject:mesh.rigidAS]; primIndex[(void *)mesh.rigidAS] = idx; }
++			else idx = pi->second;
++			PackTransform( inst.m_modelToWorld, &d.transformationMatrix );
++			d.accelerationStructureIndex = idx;
++			descs.push_back( d );
++			continue;
++		}
++		if ( (size_t)( inst.m_nBoneOffset + inst.m_nBones * 12 ) > m_frameBones.size() )
++			continue;
++		RTSkinnedInstance_t &sk = m_skinned[inst.m_nKey];
++		if ( sk.as && sk.nMesh != inst.m_nMesh )
++			DestroySkinnedInstance( sk );
++		if ( !sk.as )
++		{
++			sk.nMesh = inst.m_nMesh;
++			sk.worldVB = [m_pDevice newBufferWithLength:(size_t)mesh.nVerts * 16 options:MTLResourceStorageModePrivate];
++			sk.boneBuf = [m_pDevice newBufferWithLength:128 * 12 * sizeof( float ) options:MTLResourceStorageModeShared];
++			NSUInteger scratchLen = mesh.sizes.buildScratchBufferSize > mesh.sizes.refitScratchBufferSize ? mesh.sizes.buildScratchBufferSize : mesh.sizes.refitScratchBufferSize;
++			sk.scratch = [m_pDevice newBufferWithLength:( scratchLen > 0 ? scratchLen : 256 ) options:MTLResourceStorageModePrivate];
++			sk.as = [m_pDevice newAccelerationStructureWithSize:mesh.sizes.accelerationStructureSize];
++			sk.bBuilt = false;
++		}
++		int nBones = inst.m_nBones < 128 ? inst.m_nBones : 128;
++		memcpy( [sk.boneBuf contents], &m_frameBones[inst.m_nBoneOffset], (size_t)nBones * 12 * sizeof( float ) );
++		sk.nLastFrame = m_nFrameCounter;
++		if ( !ce )
++		{
++			ce = [cb computeCommandEncoder];
++			[ce setComputePipelineState:m_pSkin];
++		}
++		unsigned int nVerts = mesh.nVerts;
++		[ce setBytes:&nVerts length:sizeof( nVerts ) atIndex:0];
++		[ce setBuffer:mesh.vb offset:0 atIndex:1];
++		[ce setBuffer:mesh.boneIdx offset:0 atIndex:2];
++		[ce setBuffer:mesh.boneWeight offset:0 atIndex:3];
++		[ce setBuffer:sk.boneBuf offset:0 atIndex:4];
++		[ce setBuffer:sk.worldVB offset:0 atIndex:5];
++		[ce dispatchThreads:MTLSizeMake( mesh.nVerts, 1, 1 ) threadsPerThreadgroup:MTLSizeMake( 64, 1, 1 )];
++		skinnedThisFrame.push_back( std::make_pair( &sk, &mesh ) );
++		nSkinned++;
++
++		int idx = (int)[prims count];
++		[prims addObject:sk.as];
++		PackTransform( s_identity, &d.transformationMatrix );	// already in world space
++		d.accelerationStructureIndex = idx;
++		descs.push_back( d );
++	}
++	if ( ce )
++		[ce endEncoding];
++
++	// free skinned instances that have not been seen for a while
++	for ( auto it = m_skinned.begin(); it != m_skinned.end(); )
++	{
++		if ( m_nFrameCounter - it->second.nLastFrame > 120 ) { DestroySkinnedInstance( it->second ); it = m_skinned.erase( it ); }
++		else ++it;
++	}
++
++	// instance structure buffers
++	int nInst = (int)descs.size();
++	if ( nInst > m_nInstanceCapacity || !m_pInstanceDescBuffer )
++	{
++		int cap = nInst < 256 ? 256 : nInst * 2;
++		[m_pInstanceDescBuffer release];
++		m_pInstanceDescBuffer = [m_pDevice newBufferWithLength:(size_t)cap * sizeof( MTLAccelerationStructureInstanceDescriptor ) options:MTLResourceStorageModeShared];
++		m_nInstanceCapacity = cap;
++	}
++	memcpy( [m_pInstanceDescBuffer contents], descs.data(), descs.size() * sizeof( MTLAccelerationStructureInstanceDescriptor ) );
++
++	MTLInstanceAccelerationStructureDescriptor *idesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
++	idesc.instanceDescriptorBuffer = m_pInstanceDescBuffer;
++	idesc.instanceDescriptorStride = sizeof( MTLAccelerationStructureInstanceDescriptor );
++	idesc.instanceCount = nInst;
++	idesc.instancedAccelerationStructures = prims;
++	MTLAccelerationStructureSizes isz = [m_pDevice accelerationStructureSizesWithDescriptor:idesc];
++	if ( !m_pInstanceAS || [m_pInstanceAS size] < isz.accelerationStructureSize )
++	{
++		[m_pInstanceAS release];
++		m_pInstanceAS = [m_pDevice newAccelerationStructureWithSize:isz.accelerationStructureSize * 2];
++	}
++	if ( !m_pInstanceScratch || [m_pInstanceScratch length] < isz.buildScratchBufferSize )
++	{
++		[m_pInstanceScratch release];
++		m_pInstanceScratch = [m_pDevice newBufferWithLength:isz.buildScratchBufferSize * 2 + 256 options:MTLResourceStorageModePrivate];
++	}
++
++	ae = [cb accelerationStructureCommandEncoder];
++	for ( auto &pr : skinnedThisFrame )
++	{
++		RTSkinnedInstance_t *pSk = pr.first;
++		MTLPrimitiveAccelerationStructureDescriptor *desc = MeshDescriptor( *pr.second, pSk->worldVB );
++		if ( !pSk->bBuilt )
++		{
++			[ae buildAccelerationStructure:pSk->as descriptor:desc scratchBuffer:pSk->scratch scratchBufferOffset:0];
++			pSk->bBuilt = true;
++		}
++		else
++		{
++			[ae refitAccelerationStructure:pSk->as descriptor:desc destination:pSk->as scratchBuffer:pSk->scratch scratchBufferOffset:0];
++		}
++	}
++	[ae buildAccelerationStructure:m_pInstanceAS descriptor:idesc scratchBuffer:m_pInstanceScratch scratchBufferOffset:0];
++	[ae endEncoding];
++
++	m_nLastInstanceCount = nInst - 1;
++	m_nLastSkinnedCount = nSkinned;
++	*ppInstanceAS = m_pInstanceAS;
++	*ppPrimitiveASes = prims;
++	*pnInstances = nInst;
++	return true;
+ }
+ 
+ static id<MTLTexture> MakeTex( id<MTLDevice> dev, MTLPixelFormat fmt, int w, int h, IOSurfaceRef surface )
+@@ -488,13 +834,23 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 		double t0 = CFAbsoluteTimeGetCurrent();
+ 		id<MTLTexture> histIn = m_pHistory[m_nHistoryIndex], histOut = m_pHistory[m_nHistoryIndex ^ 1];
+ 		id<MTLCommandBuffer> cb = [m_pQueue commandBuffer];
++
++		id<MTLAccelerationStructure> instanceAS = nil; NSArray *prims = nil; int nInst = 0;
++		NSMutableArray *keepAlive = [NSMutableArray array];
++		double tDyn = CFAbsoluteTimeGetCurrent();
++		if ( !EncodeDynamicScene( cb, keepAlive, &instanceAS, &prims, &nInst ) )
++			return false;
++		m_flTimeDynamic += ( CFAbsoluteTimeGetCurrent() - tDyn ) * 1000.0;
++
+ 		id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+ 		MTLSize tg = MTLSizeMake( 8, 8, 1 );
+ 		MTLSize halfGrid = MTLSizeMake( m_nHalfW, m_nHalfH, 1 ), fullGrid = MTLSizeMake( m_nFullW, m_nFullH, 1 );
+ 
+ 		[ce setComputePipelineState:m_pTrace];
+ 		[ce setBytes:&gp length:sizeof( gp ) atIndex:0];
+-		[ce setAccelerationStructure:m_pAccel atBufferIndex:1];
++		[ce setAccelerationStructure:instanceAS atBufferIndex:1];
++		for ( id<MTLAccelerationStructure> prim in prims )
++			[ce useResource:prim usage:MTLResourceUsageRead];
+ 		[ce setTexture:m_pDepthTex atIndex:0]; [ce setTexture:m_pRawTex atIndex:1]; [ce setTexture:m_pNormalTex atIndex:2];
+ 		[ce dispatchThreads:halfGrid threadsPerThreadgroup:tg];
+ 
+@@ -514,7 +870,24 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 		[ce dispatchThreads:fullGrid threadsPerThreadgroup:tg];
+ 		[ce endEncoding];
+ 		[cb commit];
+-		[cb waitUntilCompleted];
++		// bounded wait: a GPU hang disables the layer instead of freezing the game
++		double tw = CFAbsoluteTimeGetCurrent();
++		while ( cb.status != MTLCommandBufferStatusCompleted && cb.status != MTLCommandBufferStatusError )
++		{
++			if ( CFAbsoluteTimeGetCurrent() - tw > 4.0 )
++			{
++				SetStatus( "GPU did not finish the ray tracing command buffer in 4 s (status %d, %d instances, %d skinned); ray tracing disabled", (int)cb.status, m_nLastInstanceCount, m_nLastSkinnedCount );
++				m_bAvailable = false;
++				return false;
++			}
++			usleep( 50 );
++		}
++		if ( cb.status == MTLCommandBufferStatusError )
++		{
++			SetStatus( "ray tracing command buffer failed: %s; ray tracing disabled", cb.error ? [[cb.error localizedDescription] UTF8String] : "unknown" );
++			m_bAvailable = false;
++			return false;
++		}
+ 		m_flTimeMetalGPU += ( cb.GPUEndTime - cb.GPUStartTime ) * 1000.0;
+ 		m_flTimeMetalWall += ( CFAbsoluteTimeGetCurrent() - t0 ) * 1000.0;
+ 
+@@ -527,9 +900,9 @@ bool CRayTracerMetal::ApplyAndComposite( const RTFrameParams &params )
+ 	m_flTimeComposite += ( CFAbsoluteTimeGetCurrent() - t1 ) * 1000.0;
+ 	if ( ++m_nTimedFrames >= 120 )
+ 	{
+-		snprintf( m_szTiming, sizeof( m_szTiming ), "per frame: depth resolve %.2f ms, metal %.2f ms wall (%.2f ms GPU), composite %.2f ms; trace %dx%d",
+-			m_flTimeResolve / m_nTimedFrames, m_flTimeMetalWall / m_nTimedFrames, m_flTimeMetalGPU / m_nTimedFrames, m_flTimeComposite / m_nTimedFrames, m_nHalfW, m_nHalfH );
+-		m_flTimeResolve = m_flTimeMetalWall = m_flTimeMetalGPU = m_flTimeComposite = 0.0; m_nTimedFrames = 0;
++		snprintf( m_szTiming, sizeof( m_szTiming ), "per frame: depth resolve %.2f ms, metal %.2f ms wall (%.2f ms GPU, %.2f ms encoding dynamic), composite %.2f ms; trace %dx%d; %d instances (%d skinned)",
++			m_flTimeResolve / m_nTimedFrames, m_flTimeMetalWall / m_nTimedFrames, m_flTimeMetalGPU / m_nTimedFrames, m_flTimeDynamic / m_nTimedFrames, m_flTimeComposite / m_nTimedFrames, m_nHalfW, m_nHalfH, m_nLastInstanceCount, m_nLastSkinnedCount );
++		m_flTimeResolve = m_flTimeMetalWall = m_flTimeMetalGPU = m_flTimeComposite = m_flTimeDynamic = 0.0; m_nTimedFrames = 0;
+ 	}
+ 	return bOK;
+ }
+-- 
+2.55.0
+

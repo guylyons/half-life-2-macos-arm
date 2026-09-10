@@ -13,15 +13,12 @@ CONS="${1:-}"
 WAIT="${RTSHOT_WAIT:-45}"
 pkill -f hl2_launcher 2>/dev/null; for i in $(seq 1 20); do pgrep -f hl2_launcher >/dev/null || break; sleep 0.5; done; sleep 1
 sed -i '' '/^rt_/d' "$TB/hl2/cfg/config.cfg" 2>/dev/null
-(HL2_BASE="$TB" "$ROOT/Half-Life 2.app/Contents/MacOS/Half-Life 2" -condebug -console +con_enable 1 +sv_cheats 1 +map "$MAP" ${LAUNCH[@]+"${LAUNCH[@]}"} > "$ROOT/rtshot.log" 2>&1 &)
+(MTL_DEBUG_LAYER=${RTSHOT_MTLDEBUG:-0} MTL_SHADER_VALIDATION=${RTSHOT_MTLDEBUG:-0} MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 HL2_BASE="$TB" "$ROOT/Half-Life 2.app/Contents/MacOS/Half-Life 2" -condebug -console +con_enable 1 +sv_cheats 1 +map "$MAP" ${LAUNCH[@]+"${LAUNCH[@]}"} > "$ROOT/rtshot.log" 2>&1 &)
 sleep "$WAIT"
 if [ -n "$CONS" ]; then
   osascript -e 'tell application "System Events" to tell process "hl2_launcher" to set frontmost to true' 2>/dev/null; sleep 1
-  osascript -e 'tell application "System Events" to keystroke "`"'; sleep 0.5
   echo "$CONS" | tr ';' '\n' > "$TB/hl2/cfg/rtshot.cfg"
-  osascript -e 'tell application "System Events" to keystroke "exec rtshot"'
-  osascript -e 'tell application "System Events" to key code 36'; sleep 0.5
-  osascript -e 'tell application "System Events" to keystroke "`"'
+  osascript -e 'tell application "System Events" to keystroke "p"'
   sleep "${RTSHOT_SETTLE:-3}"
 fi
 screencapture -x -D 2 "$OUT"
